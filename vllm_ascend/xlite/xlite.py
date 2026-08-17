@@ -1075,7 +1075,13 @@ class XliteWrapper:
         self.kv_caches = converted
 
     def _adapt_hybrid_kv_caches(self, caches: list[list[torch.Tensor]]) -> list[list[torch.Tensor]]:
-        """Map hybrid caches to xlite: paged K/V for full layers, batch-major states for GDN."""
+        """Map hybrid caches to xlite: paged K/V for full layers, slot-major GDN states.
+
+        GDN conv/ssm are addressed by vLLM mamba ``state_indices`` (stable per request),
+        not by the current batch row. Persistent buffers are slot-major; each forward
+        gathers into batch-major views that ``xlite._C`` consumes, then scatters back.
+        Slot 0 is reserved as ``NULL_BLOCK_ID``.
+        """
         cfg = self.adapter_xlite_model.xlite_config
         n_layers, interval = int(cfg.n_layers), int(cfg.full_attention_interval)
         max_batch, tp = int(cfg.max_batch_size), max(int(cfg.def_tp_size), 1)
@@ -1084,7 +1090,15 @@ class XliteWrapper:
         conv_dim = (int(cfg.linear_num_k_heads) // tp) * k_dim * 2 + n_v * v_dim
         kernel, block_size, head_dim = int(cfg.linear_conv_kernel_dim), int(cfg.block_size), int(cfg.head_dim)
         kv_heads = max(int(cfg.n_kv_heads) // tp, 1)
-        self._xlite_hybrid_state_refs = []
+        # Dense local slots only. Sparse mamba block IDs are remapped each step via
+        # ``_resolve_hybrid_dense_indices`` (pool IDs can be >> max_batch).
+        num_slots = max_batch + 1  # slot 0 == NULL_BLOCK_ID
+        self._xlite_hybrid_num_slots = num_slots
+        self._xlite_hybrid_block_to_slot: dict[int, int] = {}
+        self._xlite_hybrid_free_slots: list[int] = list(range(1, num_slots))
+        self._xlite_hybrid_persistent: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._xlite_hybrid_batch: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._xlite_hybrid_state_refs: list[torch.Tensor] = []
         adapted: list[list[torch.Tensor]] = []
 
         def as_kv(group: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1112,11 +1126,28 @@ class XliteWrapper:
             if ((i + 1) % interval) == 0:
                 adapted.append(list(as_kv(caches[i])))
             else:
-                conv = torch.zeros(max_batch, conv_dim, kernel, dtype=self.hidden_states.dtype, device=self.device)
-                ssm = torch.zeros(max_batch, n_v, k_dim, v_dim, dtype=self.hidden_states.dtype, device=self.device)
-                self._xlite_hybrid_state_refs.extend([conv, ssm])
-                adapted.append([conv, ssm])
-        logger.info("xlite hybrid KV adapted: layers=%s max_batch=%s", n_layers, max_batch)
+                conv_p = torch.zeros(
+                    num_slots, conv_dim, kernel, dtype=self.hidden_states.dtype, device=self.device
+                )
+                ssm_p = torch.zeros(
+                    num_slots, n_v, k_dim, v_dim, dtype=self.hidden_states.dtype, device=self.device
+                )
+                conv_b = torch.zeros(
+                    max_batch, conv_dim, kernel, dtype=self.hidden_states.dtype, device=self.device
+                )
+                ssm_b = torch.zeros(
+                    max_batch, n_v, k_dim, v_dim, dtype=self.hidden_states.dtype, device=self.device
+                )
+                self._xlite_hybrid_persistent.append((conv_p, ssm_p))
+                self._xlite_hybrid_batch.append((conv_b, ssm_b))
+                self._xlite_hybrid_state_refs.extend([conv_p, ssm_p, conv_b, ssm_b])
+                adapted.append([conv_b, ssm_b])
+        logger.info(
+            "xlite hybrid KV adapted: layers=%s max_batch=%s gdn_slots=%s",
+            n_layers,
+            max_batch,
+            num_slots,
+        )
         return adapted
 
     @staticmethod
@@ -1137,6 +1168,133 @@ class XliteWrapper:
                 return int(bt.shape[-1]) if bt is not None and hasattr(bt, "shape") else -1
             return max(cands, key=score)
         return None
+
+    @staticmethod
+    def _pick_gdn_state_indices(attn_metadata_raw: Any, num_reqs: int) -> torch.Tensor | None:
+        """Return per-request mamba state slots aligned with AscendMetadata rows."""
+        if num_reqs <= 0:
+            return None
+        # Lazy import: top-level import of GDNAttentionMetadata creates a circular
+        # dependency through vllm_ascend.ops / device_op.
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+        if isinstance(attn_metadata_raw, GDNAttentionMetadata):
+            metas = [attn_metadata_raw]
+        elif isinstance(attn_metadata_raw, dict):
+            metas = [m for m in attn_metadata_raw.values() if isinstance(m, GDNAttentionMetadata)]
+        elif isinstance(attn_metadata_raw, list):
+            metas = [m for m in attn_metadata_raw if isinstance(m, GDNAttentionMetadata)]
+        else:
+            return None
+        if not metas:
+            return None
+        meta = metas[0]
+        idx = meta.non_spec_state_indices_tensor
+        if idx is None and meta.spec_state_indices_tensor is not None:
+            idx = meta.spec_state_indices_tensor[:, 0]
+        if idx is None:
+            return None
+        if idx.numel() < num_reqs:
+            return None
+        return idx[:num_reqs].to(dtype=torch.long)
+
+    def _resolve_hybrid_dense_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+        """Map sparse mamba block IDs to dense local slots in ``[0, max_batch]``.
+
+        Slot 0 is reserved for ``NULL_BLOCK_ID``. Mappings are kept across steps so
+        chunked-prefill / token-budget skips do not drop GDN state. Slots are only
+        reclaimed when the free list is empty (steal a block not in this step).
+        """
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        ids = [int(x) for x in state_indices.tolist()]
+        active = {bid for bid in ids if bid != NULL_BLOCK_ID}
+
+        def _take_slot() -> int:
+            if not self._xlite_hybrid_free_slots:
+                for old_bid, old_slot in list(self._xlite_hybrid_block_to_slot.items()):
+                    if old_bid not in active:
+                        del self._xlite_hybrid_block_to_slot[old_bid]
+                        self._xlite_hybrid_free_slots.append(old_slot)
+                        break
+            if not self._xlite_hybrid_free_slots:
+                raise RuntimeError(
+                    f"xlite hybrid: no free GDN slots (active_blocks={len(active)} "
+                    f"mapped={len(self._xlite_hybrid_block_to_slot)} "
+                    f"num_slots={self._xlite_hybrid_num_slots})"
+                )
+            return self._xlite_hybrid_free_slots.pop()
+
+        dense: list[int] = []
+        for bid in ids:
+            if bid == NULL_BLOCK_ID:
+                dense.append(NULL_BLOCK_ID)
+                continue
+            slot = self._xlite_hybrid_block_to_slot.get(bid)
+            if slot is None:
+                slot = _take_slot()
+                self._xlite_hybrid_block_to_slot[bid] = slot
+                for conv_p, ssm_p in self._xlite_hybrid_persistent:
+                    conv_p[slot].zero_()
+                    ssm_p[slot].zero_()
+            dense.append(slot)
+        return torch.tensor(dense, dtype=torch.long, device=self.device)
+
+    def _gather_hybrid_linear_states(
+        self,
+        state_indices: torch.Tensor,
+        cached_lens: list[int] | None = None,
+    ) -> None:
+        """Copy persistent slot states into the batch-major buffers seen by xlite."""
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        n = int(state_indices.numel())
+        if n <= 0 or not getattr(self, "_xlite_hybrid_persistent", None):
+            return
+        idx = state_indices
+        if idx.device != self.device:
+            idx = idx.to(self.device, non_blocking=True)
+        null_mask = idx == NULL_BLOCK_ID
+        # Recycled mamba block IDs can reuse an existing dense mapping with stale
+        # state; treat cached_lens==0 as a fresh sequence and clear both sides.
+        fresh_mask = None
+        if cached_lens is not None and len(cached_lens) >= n:
+            fresh_mask = torch.tensor(
+                [int(cached_lens[i]) == 0 for i in range(n)],
+                dtype=torch.bool,
+                device=idx.device,
+            )
+            fresh_mask = fresh_mask & ~null_mask
+        for (conv_p, ssm_p), (conv_b, ssm_b) in zip(self._xlite_hybrid_persistent, self._xlite_hybrid_batch):
+            conv_b[:n].copy_(conv_p.index_select(0, idx))
+            ssm_b[:n].copy_(ssm_p.index_select(0, idx))
+            if bool(null_mask.any().item()):
+                conv_b[:n][null_mask] = 0
+                ssm_b[:n][null_mask] = 0
+            if fresh_mask is not None and bool(fresh_mask.any().item()):
+                conv_b[:n][fresh_mask] = 0
+                ssm_b[:n][fresh_mask] = 0
+                fresh_idx = idx[fresh_mask]
+                conv_p.index_fill_(0, fresh_idx, 0)
+                ssm_p.index_fill_(0, fresh_idx, 0)
+
+    def _scatter_hybrid_linear_states(self, state_indices: torch.Tensor) -> None:
+        """Write batch-major xlite states back to persistent dense slots."""
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        n = int(state_indices.numel())
+        if n <= 0 or not getattr(self, "_xlite_hybrid_persistent", None):
+            return
+        idx = state_indices
+        if idx.device != self.device:
+            idx = idx.to(self.device, non_blocking=True)
+        valid = idx != NULL_BLOCK_ID
+        if not bool(valid.any().item()):
+            return
+        valid_idx = idx[valid]
+        for (conv_p, ssm_p), (conv_b, ssm_b) in zip(self._xlite_hybrid_persistent, self._xlite_hybrid_batch):
+            conv_p.index_copy_(0, valid_idx, conv_b[:n][valid])
+            ssm_p.index_copy_(0, valid_idx, ssm_b[:n][valid])
 
     def __call__(
         self,
@@ -1282,13 +1440,20 @@ class XliteWrapper:
                     self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
                     "runnable(hybrid query_lens sum mismatch)",
                 )
-            # Refuse capture/dummy all-zero tables on decode.
-            for i, cached in enumerate(cached_lens_list):
-                if cached > 0 and int(block_tables_list[i][0]) == 0:
-                    return _ensure_output(
-                        self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
-                        "runnable(hybrid dummy block_table)",
+            # Map GDN states by stable mamba slot (not batch row). Without indices,
+            # fall back to identity so single-request paths keep working.
+            state_indices = self._pick_gdn_state_indices(attn_metadata_raw, num_reqs)
+            if state_indices is None:
+                # Avoid slot 0 (NULL_BLOCK_ID). Identity is only safe for single-req.
+                state_indices = torch.arange(1, num_reqs + 1, dtype=torch.long, device=self.device)
+                if num_reqs > 1:
+                    logger.warning_once(
+                        "xlite hybrid: GDN state_indices missing; using batch-row identity "
+                        "(incorrect under continuous-batch reorder)"
                     )
+            else:
+                state_indices = self._resolve_hybrid_dense_indices(state_indices)
+            self._gather_hybrid_linear_states(state_indices, cached_lens_list)
             xlite_attn_metadata = AttnMeta()
             xlite_attn_metadata.lens = query_lens_list
             xlite_attn_metadata.cached_lens = cached_lens_list
@@ -1311,6 +1476,7 @@ class XliteWrapper:
                 )
                 if xlite_deepstack and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                     self.runnable._clear_deepstack_input_embeds(emb.size(0))
+            self._scatter_hybrid_linear_states(state_indices)
             return _ensure_output(h[:num_actual_tokens], "xlite hybrid forward")
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
