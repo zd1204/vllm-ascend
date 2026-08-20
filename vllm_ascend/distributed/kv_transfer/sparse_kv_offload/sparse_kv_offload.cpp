@@ -327,10 +327,48 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
   return num_tokens_to_load_sum;
 }
 
+// Graph-safe packed onload: one contiguous H2D plus D2D scatter.
+// Called from the captured host callback (same as lru_resident_compact), not
+// via torch.ops, so ACL graph does not record boxed JIT memcpy operators.
+void packed_h2d_d2d(int64_t host_base, int64_t device_base, int64_t nbytes,
+                    const at::Tensor& dst_ptrs, const at::Tensor& sizes) {
+  TORCH_CHECK(dst_ptrs.device().is_cpu(), "packed_h2d_d2d dst_ptrs must be CPU");
+  TORCH_CHECK(sizes.device().is_cpu(), "packed_h2d_d2d sizes must be CPU");
+  TORCH_CHECK(dst_ptrs.scalar_type() == at::kLong, "packed_h2d_d2d dst_ptrs must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kLong, "packed_h2d_d2d sizes must be int64");
+  TORCH_CHECK(dst_ptrs.size(0) == sizes.size(0), "packed_h2d_d2d dst/size length mismatch");
+
+  if (nbytes > 0) {
+    TORCH_CHECK(host_base != 0 && device_base != 0, "packed_h2d_d2d null staging ptr");
+    aclError ret = aclrtMemcpy(reinterpret_cast<void*>(device_base), static_cast<size_t>(nbytes),
+                               reinterpret_cast<const void*>(host_base), static_cast<size_t>(nbytes),
+                               ACL_MEMCPY_HOST_TO_DEVICE);
+    TORCH_CHECK(ret == ACL_SUCCESS, "packed_h2d_d2d H2D failed with ", ret, ", nbytes=", nbytes);
+  }
+
+  const int64_t n = dst_ptrs.size(0);
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int64_t* sz = sizes.data_ptr<int64_t>();
+  int64_t running = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    const int64_t copy_size = sz[i];
+    if (copy_size <= 0 || dst[i] == 0) {
+      continue;
+    }
+    aclError ret = aclrtMemcpy(reinterpret_cast<void*>(dst[i]), static_cast<size_t>(copy_size),
+                               reinterpret_cast<const void*>(device_base + running),
+                               static_cast<size_t>(copy_size), ACL_MEMCPY_DEVICE_TO_DEVICE);
+    TORCH_CHECK(ret == ACL_SUCCESS, "packed_h2d_d2d D2D failed at ", i, " with ", ret);
+    running += copy_size;
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   m.def("lru_resident_compact", &lru_resident_compact,
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
+  m.def("packed_h2d_d2d", &packed_h2d_d2d,
+        "Contiguous H2D plus D2D scatter; safe to call from ACL graph host callback");
 }

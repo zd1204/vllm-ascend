@@ -2218,9 +2218,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     // Contiguous large H2D/D2H/D2D byte copy on the current NPU stream.
     // Pointers are raw addresses (host or device) expressed as int64.
+    // Register on CPU like swap_blocks_batch: CompositeExplicitAutograd goes
+    // through boxed JIT and can segfault under ACL graph / torch.ops dispatch.
     ops.def("memcpy_contiguous_async(int src_ptr, int dst_ptr, int nbytes, int direction) -> ()");
-    ops.impl("memcpy_contiguous_async", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::memcpy_contiguous_async);
+    ops.impl("memcpy_contiguous_async", torch::kCPU, &vllm_ascend::memcpy_contiguous_async);
     ops.def("device_print(str msg) -> ()");
     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));

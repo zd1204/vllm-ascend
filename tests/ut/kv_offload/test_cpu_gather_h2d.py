@@ -93,20 +93,15 @@ def test_sparse_manager_submit_h2d_cpu_gather_path(monkeypatch):
         SparseKVOffloadManager,
     )
 
-    contiguous_calls: list[tuple] = []
-    batch_calls: list[int] = []
-
-    fake_ops = types.SimpleNamespace(
-        memcpy_contiguous_async=lambda *args: contiguous_calls.append(args),
-        swap_blocks_batch=lambda *args: batch_calls.append(args[3]),
-    )
-    monkeypatch.setattr(torch.ops, "_C_ascend", fake_ops, raising=False)
+    packed_calls: list[tuple] = []
 
     manager = MagicMock()
-    manager._gather_pool = CpuGatherPool(num_threads=2)
-    manager._host_gather_buf = torch.empty(4096, dtype=torch.uint8, device="cpu")
-    manager._device_staging_buf = torch.empty(4096, dtype=torch.uint8, device="cpu")
+    manager._gather_pool = None
+    manager._host_gather_buf = None
+    manager._device_staging_buf = None
     manager._cpu_gather_buffer_bytes = 4096
+    manager._cpu_gather_threads = 1
+    manager.topk_buffers_k = [torch.empty(1)]
     manager.num_tokens_buffer_cpu = torch.tensor([2], dtype=torch.int32)
     host_src = (ctypes.c_uint8 * 64)()
     manager.gvas_buffer_cpu = torch.tensor(
@@ -115,15 +110,28 @@ def test_sparse_manager_submit_h2d_cpu_gather_path(monkeypatch):
     )
     manager.addr_buffer_cpu = torch.tensor([1000, 2000], dtype=torch.int64)
     manager.size_buffer_cpu = torch.tensor([32, 32], dtype=torch.int32)
+    manager._gather_src_ptrs = None
+    manager._gather_dst_ptrs = None
+    manager._gather_sizes = None
+    manager._gather_h2d_src = None
+    manager._gather_h2d_dst = None
+    manager._gather_h2d_size = None
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(
+        packed_h2d_d2d=lambda *args: packed_calls.append((args[2], args[3].tolist(), args[4].tolist()))
+    )
+    manager._ensure_cpu_gather_resources = lambda: SparseKVOffloadManager._ensure_cpu_gather_resources(manager)
 
     try:
         ok = SparseKVOffloadManager._submit_h2d_cpu_gather(manager)
         assert ok is True
-        assert len(contiguous_calls) == 1
-        assert contiguous_calls[0][3] == 0
-        assert batch_calls == [2]
+        assert len(packed_calls) == 1
+        nbytes, dsts, sizes = packed_calls[0]
+        assert nbytes == 64
+        assert dsts == [1000, 2000]
+        assert sizes == [32, 32]
     finally:
-        manager._gather_pool.close()
+        if manager._gather_pool is not None:
+            manager._gather_pool.close()
 
 
 def test_sparse_manager_submit_h2d_cpu_gather_falls_back_when_too_large():
@@ -140,6 +148,10 @@ def test_sparse_manager_submit_h2d_cpu_gather_falls_back_when_too_large():
     manager.gvas_buffer_cpu = torch.tensor([1], dtype=torch.int64)
     manager.addr_buffer_cpu = torch.tensor([2], dtype=torch.int64)
     manager.size_buffer_cpu = torch.tensor([64], dtype=torch.int32)
+    manager._gather_dst_ptrs = torch.empty(1, dtype=torch.int64)
+    manager._gather_sizes = torch.empty(1, dtype=torch.int64)
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(packed_h2d_d2d=lambda *args: None)
+    manager._ensure_cpu_gather_resources = lambda: True
 
     try:
         assert SparseKVOffloadManager._submit_h2d_cpu_gather(manager) is False
