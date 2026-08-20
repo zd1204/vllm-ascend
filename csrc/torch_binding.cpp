@@ -242,6 +242,52 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     }
 }
 
+// Contiguous byte-level async memcpy on the current NPU stream.
+// Used by CPU-gather H2D (C-scheme): one large H2D after host gather, and
+// reusable for other contiguous host/device byte copies.
+// direction: 0=H2D, 1=D2H, 2=D2D
+void memcpy_contiguous_async(int64_t src_ptr,
+                             int64_t dst_ptr,
+                             int64_t nbytes,
+                             int64_t direction) {
+    if (nbytes == 0) {
+        return;
+    }
+    TORCH_CHECK(nbytes > 0, "memcpy_contiguous_async: nbytes must be >= 0");
+    TORCH_CHECK(src_ptr != 0, "memcpy_contiguous_async: src_ptr is null");
+    TORCH_CHECK(dst_ptr != 0, "memcpy_contiguous_async: dst_ptr is null");
+
+    aclrtMemcpyKind memcpy_kind;
+    switch (direction) {
+        case 0:
+            memcpy_kind = ACL_MEMCPY_HOST_TO_DEVICE;
+            break;
+        case 1:
+            memcpy_kind = ACL_MEMCPY_DEVICE_TO_HOST;
+            break;
+        case 2:
+            memcpy_kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "memcpy_contiguous_async: invalid direction ", direction,
+                        " (expected 0=H2D, 1=D2H, 2=D2D)");
+    }
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    const size_t copy_size = static_cast<size_t>(nbytes);
+    aclError ret = aclrtMemcpyAsync(
+        reinterpret_cast<void*>(dst_ptr),
+        copy_size,
+        reinterpret_cast<const void*>(src_ptr),
+        copy_size,
+        memcpy_kind,
+        stream);
+    TORCH_CHECK(ret == ACL_SUCCESS,
+                "memcpy_contiguous_async: aclrtMemcpyAsync failed with error ",
+                ret, ", src=", src_ptr, ", dst=", dst_ptr, ", nbytes=", nbytes);
+}
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
@@ -2169,6 +2215,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // internally submits async memcpy on the current NPU stream.
     ops.def("swap_blocks_batch(Tensor x, Tensor y, Tensor z, int direction) -> ()");
     ops.impl("swap_blocks_batch", torch::kCPU, &vllm_ascend::swap_blocks_batch);
+
+    // Contiguous large H2D/D2H/D2D byte copy on the current NPU stream.
+    // Pointers are raw addresses (host or device) expressed as int64.
+    ops.def("memcpy_contiguous_async(int src_ptr, int dst_ptr, int nbytes, int direction) -> ()");
+    ops.impl("memcpy_contiguous_async", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::memcpy_contiguous_async);
     ops.def("device_print(str msg) -> ()");
     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));

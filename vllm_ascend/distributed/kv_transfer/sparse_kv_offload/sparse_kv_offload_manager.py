@@ -370,6 +370,14 @@ class SparseKVOffloadManager:
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
 
+        # Populated in register_kv_caches via _init_cpu_gather_h2d().
+        self._enable_cpu_gather_h2d = False
+        self._gather_pool = None
+        self._host_gather_buf = None
+        self._device_staging_buf = None
+        self._cpu_gather_buffer_bytes = 0
+        self._cpu_gather_threads = 0
+
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
         ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
@@ -761,6 +769,131 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+        self._init_cpu_gather_h2d()
+
+    def _init_cpu_gather_h2d(self) -> None:
+        """Optional C-scheme H2D: host gather -> contiguous H2D -> device scatter.
+
+        Used as an alternative to memfabric sparse_copy for Sparse KV Offload
+        onload. Graph capture falls back to sparse_copy because gather needs
+        synchronous host memcpy.
+        """
+        from vllm_ascend import envs
+        from vllm_ascend.kv_offload.cpu_gather import CpuGatherPool
+
+        self._enable_cpu_gather_h2d = bool(envs.VLLM_ASCEND_ENABLE_CPU_GATHER_H2D)
+        self._cpu_gather_buffer_bytes = int(envs.VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES)
+        self._cpu_gather_threads = int(envs.VLLM_ASCEND_CPU_GATHER_THREADS)
+        self._gather_pool: CpuGatherPool | None = None
+        self._host_gather_buf: torch.Tensor | None = None
+        self._device_staging_buf: torch.Tensor | None = None
+
+        if not self._enable_cpu_gather_h2d:
+            return
+
+        device = self.topk_buffers_k[0].device
+        self._gather_pool = CpuGatherPool(num_threads=self._cpu_gather_threads)
+        self._host_gather_buf = torch.empty(
+            self._cpu_gather_buffer_bytes,
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._device_staging_buf = torch.empty(
+            self._cpu_gather_buffer_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        logger.info(
+            "Sparse KV offload CPU gather H2D enabled: threads=%d, buffer_bytes=%d",
+            self._cpu_gather_threads,
+            self._cpu_gather_buffer_bytes,
+        )
+
+    def _submit_h2d_cpu_gather(self) -> bool:
+        """Submit H2D via CPU gather + contiguous H2D + D2D scatter.
+
+        Returns False when gather cannot be used (caller falls back to sparse_copy).
+        """
+        from vllm_ascend.kv_offload.cpu_gather import GatherItem, split_by_buffer_capacity
+
+        if self._gather_pool is None or self._host_gather_buf is None or self._device_staging_buf is None:
+            return False
+
+        num_entries = int(self.num_tokens_buffer_cpu[0].item())
+        if num_entries <= 0:
+            return True
+
+        all_src = self.gvas_buffer_cpu[:num_entries].numpy()
+        all_dst = self.addr_buffer_cpu[:num_entries].numpy()
+        all_sizes = self.size_buffer_cpu[:num_entries].to(torch.int64).numpy()
+
+        ranges = split_by_buffer_capacity(all_sizes, self._cpu_gather_buffer_bytes)
+        if not ranges:
+            return False
+
+        host_base = self._host_gather_buf.data_ptr()
+        device_base = self._device_staging_buf.data_ptr()
+
+        for begin, end in ranges:
+            chunk_src = all_src[begin:end]
+            chunk_dst = all_dst[begin:end]
+            chunk_sizes = all_sizes[begin:end]
+            if chunk_sizes.size == 0:
+                continue
+
+            items: list[GatherItem] = []
+            offset = 0
+            for src_ptr, size in zip(chunk_src.tolist(), chunk_sizes.tolist()):
+                size_i = int(size)
+                if size_i <= 0:
+                    continue
+                items.append(GatherItem(src_ptr=int(src_ptr), dst_offset=offset, size=size_i))
+                offset += size_i
+            if not items:
+                continue
+
+            self._gather_pool.gather(items, host_base)
+            if hasattr(torch.ops._C_ascend, "memcpy_contiguous_async"):
+                torch.ops._C_ascend.memcpy_contiguous_async(
+                    host_base,
+                    device_base,
+                    offset,
+                    0,  # H2D
+                )
+            else:
+                # Fallback when extension was built without memcpy_contiguous_async.
+                torch.ops._C_ascend.swap_blocks_batch(
+                    torch.tensor([host_base], dtype=torch.int64),
+                    torch.tensor([device_base], dtype=torch.int64),
+                    torch.tensor([offset], dtype=torch.int64),
+                    0,  # H2D
+                )
+
+            staging_srcs = np.empty(len(items), dtype=np.int64)
+            staging_dsts = np.empty(len(items), dtype=np.int64)
+            staging_sizes = np.empty(len(items), dtype=np.int64)
+            running = 0
+            item_idx = 0
+            for dst_ptr, size in zip(chunk_dst.tolist(), chunk_sizes.tolist()):
+                size_i = int(size)
+                if size_i <= 0:
+                    continue
+                staging_srcs[item_idx] = device_base + running
+                staging_dsts[item_idx] = int(dst_ptr)
+                staging_sizes[item_idx] = size_i
+                running += size_i
+                item_idx += 1
+
+            torch.ops._C_ascend.swap_blocks_batch(
+                torch.from_numpy(staging_srcs[:item_idx].copy()),
+                torch.from_numpy(staging_dsts[:item_idx].copy()),
+                torch.from_numpy(staging_sizes[:item_idx].copy()),
+                2,  # D2D
+            )
+
+        return True
+
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
@@ -904,6 +1037,7 @@ class SparseKVOffloadManager:
             )
             self.gvas_buffer_npu += gvas_offset
             self.addr_buffer_npu += addr_offset
+            use_cpu_gather = False
         else:
             if token_to_req_npu is not None:
                 block_table_cpu = self.block_table_expanded_cpu[:num_tokens]
@@ -961,19 +1095,30 @@ class SparseKVOffloadManager:
             else:
                 self._onload_topk_kv_cpu(args)
 
-            self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+            # Graph capture keeps memfabric sparse_copy. Eager mode may use
+            # CPU gather + contiguous H2D when enabled.
+            use_cpu_gather = False
+            if self._enable_cpu_gather_h2d and not capturing:
+                use_cpu_gather = self._submit_h2d_cpu_gather()
+            if not use_cpu_gather:
+                self.sparse_copy_args_buffer_npu.copy_(
+                    self.sparse_copy_args_buffer_cpu,
+                    non_blocking=capturing,
+                )
 
         if self.tp_size > 1:
             # Make sure that tp0 d2h is finished before other tp's h2d.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
-        offload.sparse_copy(
-            self.gvas_buffer_npu,
-            self.addr_buffer_npu,
-            self.size_buffer_npu,
-            self.num_tokens_buffer_npu,
-            self.topk_buffers_k[0].device,
-        )
+
+        if not use_cpu_gather:
+            offload.sparse_copy(
+                self.gvas_buffer_npu,
+                self.addr_buffer_npu,
+                self.size_buffer_npu,
+                self.num_tokens_buffer_npu,
+                self.topk_buffers_k[0].device,
+            )
 
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
