@@ -3,7 +3,7 @@
 """Compare Sparse KV H2D before/after CPU gather aggregation.
 
 聚合前: swap_blocks_batch H2D (discrete host blocks -> discrete device blocks)
-聚合后: CpuGatherPool + memcpy_contiguous_async(H2D) + swap_blocks_batch(D2D)
+聚合后: CpuGatherPool + single-entry swap_blocks_batch(H2D) + swap_blocks_batch(D2D)
 
 Also optionally measures memfabric offload.sparse_copy when --also-sparse-copy is set.
 """
@@ -35,6 +35,20 @@ def _p50_p99(xs: list[float]) -> tuple[float, float]:
 
 def _mean(xs: list[float]) -> float:
     return statistics.mean(xs) if xs else 0.0
+
+
+def _contiguous_h2d(host_base: int, device_base: int, nbytes: int) -> None:
+    """One large H2D on the current NPU stream."""
+    if nbytes <= 0:
+        return
+    # Keep benchmark on the same verified path as the minimal single-op test:
+    # one contiguous H2D expressed as a single swap_blocks_batch entry.
+    torch.ops._C_ascend.swap_blocks_batch(
+        torch.tensor([host_base], dtype=torch.int64),
+        torch.tensor([device_base], dtype=torch.int64),
+        torch.tensor([nbytes], dtype=torch.int64),
+        0,
+    )
 
 
 def bench_case(
@@ -101,19 +115,7 @@ def bench_case(
             _sync()
             t0 = time.perf_counter()
             pool.gather(items, host_base)
-            # Contiguous H2D: prefer memcpy_contiguous_async when present in
-            # the loaded extension; otherwise one-entry swap_blocks_batch.
-            if hasattr(torch.ops._C_ascend, "memcpy_contiguous_async"):
-                torch.ops._C_ascend.memcpy_contiguous_async(
-                    host_base, device_base, total_bytes, 0
-                )
-            else:
-                torch.ops._C_ascend.swap_blocks_batch(
-                    torch.tensor([host_base], dtype=torch.int64),
-                    torch.tensor([device_base], dtype=torch.int64),
-                    torch.tensor([total_bytes], dtype=torch.int64),
-                    0,
-                )
+            _contiguous_h2d(host_base, device_base, total_bytes)
             torch.ops._C_ascend.swap_blocks_batch(staging_srcs, staging_dsts, staging_sizes, 2)
             _sync()
             if i >= warmup:

@@ -100,13 +100,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to use CPU gather + contiguous H2D (C-scheme) for KV offload H2D.
-    # 0: disable (default), use per-block / batch memcpy path.
-    # 1: enable multithreaded host gather into pinned staging, then one large H2D
-    #    followed by device-side scatter to discrete KV blocks.
+    # Whether to use packed H2D for Sparse KV Offload decode onload.
+    # 0: disable (default), discrete memfabric sparse_copy.
+    # 1: TP0 OpenMP-gathers discrete GVA blocks into a SHARED packed staging
+    #    buffer, then ACL one-shot H2D. Other ranks sparse_copy the same packed
+    #    GVA (n=1) and scatter D2D into local topk slots. ACL graph capture/replay
+    #    still uses discrete sparse_copy.
     "VLLM_ASCEND_ENABLE_CPU_GATHER_H2D": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CPU_GATHER_H2D", "0"))),
-    # Number of worker threads for CPU gather memcpy. Valid range: >= 1.
-    # Default: 4.
+    # Number of OpenMP threads for TP0 host packing. Valid range: >= 1.
+    # Default: 4. Setting this to 1 serializes host packing and is slower.
     "VLLM_ASCEND_CPU_GATHER_THREADS": lambda: max(1, int(os.getenv("VLLM_ASCEND_CPU_GATHER_THREADS", "4"))),
     # Host/device staging buffer size in bytes for CPU gather H2D. Transfers
     # larger than this are processed in chunks. Default: 8 MiB.

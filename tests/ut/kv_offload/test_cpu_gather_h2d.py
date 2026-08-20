@@ -88,72 +88,154 @@ def test_split_by_buffer_capacity_chunks_and_fallback():
     assert split_by_buffer_capacity(np.array([], dtype=np.int64), 100) == []
 
 
-def test_sparse_manager_submit_h2d_cpu_gather_path(monkeypatch):
+def test_cpu_gather_enabled_on_all_eager_ranks():
     from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
         SparseKVOffloadManager,
     )
 
-    packed_calls: list[tuple] = []
-
     manager = MagicMock()
-    manager._gather_pool = None
-    manager._host_gather_buf = None
-    manager._device_staging_buf = None
-    manager._cpu_gather_buffer_bytes = 4096
-    manager._cpu_gather_threads = 1
-    manager.topk_buffers_k = [torch.empty(1)]
-    manager.num_tokens_buffer_cpu = torch.tensor([2], dtype=torch.int32)
+    manager._enable_cpu_gather_h2d = True
+    manager._packed_gva = 0x1000
+    manager.tp_rank = 0
+    assert SparseKVOffloadManager._should_use_cpu_gather(manager, capturing=False) is True
+    assert SparseKVOffloadManager._should_use_cpu_gather(manager, capturing=True) is False
+    manager.tp_rank = 1
+    assert SparseKVOffloadManager._should_use_cpu_gather(manager, capturing=False) is True
+    manager._enable_cpu_gather_h2d = False
+    manager.tp_rank = 0
+    assert SparseKVOffloadManager._should_use_cpu_gather(manager, capturing=False) is False
+
+
+def test_tp0_pack_host_gather_only_copies_on_rank0():
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+        SparseKVOffloadManager,
+    )
+
+    packed_calls: list[int] = []
+
+    def fake_pack(*args):
+        packed_calls.append(int(args[3]))
+        return 64
+
     host_src = (ctypes.c_uint8 * 64)()
+    manager = MagicMock()
+    manager._packed_gva = ctypes.addressof(host_src)
+    manager._packed_nbytes = 0
+    manager._cpu_gather_buffer_bytes = 4096
+    manager._cpu_gather_threads = 4
+    manager.tp_rank = 0
+    manager.num_tokens_buffer_cpu = torch.tensor([2], dtype=torch.int32)
     manager.gvas_buffer_cpu = torch.tensor(
         [ctypes.addressof(host_src), ctypes.addressof(host_src) + 32],
         dtype=torch.int64,
     )
     manager.addr_buffer_cpu = torch.tensor([1000, 2000], dtype=torch.int64)
     manager.size_buffer_cpu = torch.tensor([32, 32], dtype=torch.int32)
-    manager._gather_src_ptrs = None
-    manager._gather_dst_ptrs = None
-    manager._gather_sizes = None
-    manager._gather_h2d_src = None
-    manager._gather_h2d_dst = None
-    manager._gather_h2d_size = None
-    manager.sparse_kv_offload_cpp = types.SimpleNamespace(
-        packed_h2d_d2d=lambda *args: packed_calls.append((args[2], args[3].tolist(), args[4].tolist()))
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(packed_host_gather=fake_pack)
+
+    assert SparseKVOffloadManager._tp0_pack_host_gather(manager) is True
+    assert packed_calls == [2]
+    assert manager._packed_nbytes == 64
+
+    packed_calls.clear()
+    manager.tp_rank = 1
+    assert SparseKVOffloadManager._tp0_pack_host_gather(manager) is True
+    assert packed_calls == []
+    assert manager._packed_nbytes == 64
+
+
+def test_submit_packed_h2d_tp0_uses_contiguous_acl(monkeypatch):
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+        SparseKVOffloadManager,
     )
+
+    h2d_calls: list[tuple] = []
+    scatter_calls: list[int] = []
+
+    manager = MagicMock()
+    manager.tp_rank = 0
+    manager._packed_gva = 0xABC0
+    manager._packed_nbytes = 64
+    manager._cpu_gather_buffer_bytes = 4096
+    manager.topk_buffers_k = [torch.empty(1)]
+    manager.num_tokens_buffer_cpu = torch.tensor([2], dtype=torch.int32)
+    manager.gvas_buffer_cpu = torch.tensor([1, 2], dtype=torch.int64)
+    manager.addr_buffer_cpu = torch.tensor([1000, 2000], dtype=torch.int64)
+    manager.size_buffer_cpu = torch.tensor([32, 32], dtype=torch.int32)
+    manager._device_staging_buf = None
+    manager._packed_h2d_src_npu = None
     manager._ensure_cpu_gather_resources = lambda: SparseKVOffloadManager._ensure_cpu_gather_resources(manager)
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(
+        packed_contiguous_h2d=lambda *args: h2d_calls.append((int(args[0]), int(args[2]))) or True,
+        packed_d2d_scatter=lambda *args: scatter_calls.append(int(args[3])) or True,
+    )
 
-    try:
-        ok = SparseKVOffloadManager._submit_h2d_cpu_gather(manager)
-        assert ok is True
-        assert len(packed_calls) == 1
-        nbytes, dsts, sizes = packed_calls[0]
-        assert nbytes == 64
-        assert dsts == [1000, 2000]
-        assert sizes == [32, 32]
-    finally:
-        if manager._gather_pool is not None:
-            manager._gather_pool.close()
+    ok = SparseKVOffloadManager._submit_packed_sparse_h2d_and_d2d(manager)
+    assert ok is True
+    assert h2d_calls == [(0xABC0, 64)]
+    assert scatter_calls == [2]
 
 
-def test_sparse_manager_submit_h2d_cpu_gather_falls_back_when_too_large():
+def test_submit_packed_h2d_non_tp0_uses_sparse_copy(monkeypatch):
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as mod
+    from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+        SparseKVOffloadManager,
+    )
+
+    sparse_calls: list[tuple] = []
+    scatter_calls: list[int] = []
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None, raising=False)
+    monkeypatch.setattr(
+        mod.offload,
+        "sparse_copy",
+        lambda src, dst, sizes, num, device: sparse_calls.append(
+            (int(src[0].item()), int(dst[0].item()), int(sizes[0].item()), int(num[0].item()))
+        )
+        or 0,
+        raising=False,
+    )
+
+    manager = MagicMock()
+    manager.tp_rank = 1
+    manager._packed_gva = 0xABC0
+    manager._packed_nbytes = 64
+    manager._cpu_gather_buffer_bytes = 4096
+    manager.topk_buffers_k = [torch.empty(1)]
+    manager.num_tokens_buffer_cpu = torch.tensor([2], dtype=torch.int32)
+    manager.gvas_buffer_cpu = torch.tensor([1, 2], dtype=torch.int64)
+    manager.addr_buffer_cpu = torch.tensor([1000, 2000], dtype=torch.int64)
+    manager.size_buffer_cpu = torch.tensor([32, 32], dtype=torch.int32)
+    manager._device_staging_buf = None
+    manager._packed_h2d_src_npu = None
+    manager._ensure_cpu_gather_resources = lambda: SparseKVOffloadManager._ensure_cpu_gather_resources(manager)
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(
+        packed_d2d_scatter=lambda *args: scatter_calls.append(int(args[3])) or True
+    )
+
+    ok = SparseKVOffloadManager._submit_packed_sparse_h2d_and_d2d(manager)
+    assert ok is True
+    assert len(sparse_calls) == 1
+    src, dst, nbytes, n = sparse_calls[0]
+    assert src == 0xABC0
+    assert nbytes == 64
+    assert n == 1
+    assert dst != 0
+    assert scatter_calls == [2]
+
+
+def test_tp0_pack_host_gather_falls_back_when_too_large():
     from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
         SparseKVOffloadManager,
     )
 
     manager = MagicMock()
-    manager._gather_pool = CpuGatherPool(num_threads=1)
-    manager._host_gather_buf = torch.empty(16, dtype=torch.uint8, device="cpu")
-    manager._device_staging_buf = torch.empty(16, dtype=torch.uint8, device="cpu")
+    manager._packed_gva = 1
     manager._cpu_gather_buffer_bytes = 16
+    manager.tp_rank = 0
     manager.num_tokens_buffer_cpu = torch.tensor([1], dtype=torch.int32)
     manager.gvas_buffer_cpu = torch.tensor([1], dtype=torch.int64)
     manager.addr_buffer_cpu = torch.tensor([2], dtype=torch.int64)
     manager.size_buffer_cpu = torch.tensor([64], dtype=torch.int32)
-    manager._gather_dst_ptrs = torch.empty(1, dtype=torch.int64)
-    manager._gather_sizes = torch.empty(1, dtype=torch.int64)
-    manager.sparse_kv_offload_cpp = types.SimpleNamespace(packed_h2d_d2d=lambda *args: None)
-    manager._ensure_cpu_gather_resources = lambda: True
+    manager.sparse_kv_offload_cpp = types.SimpleNamespace(packed_host_gather=lambda *args: 0)
 
-    try:
-        assert SparseKVOffloadManager._submit_h2d_cpu_gather(manager) is False
-    finally:
-        manager._gather_pool.close()
+    assert SparseKVOffloadManager._tp0_pack_host_gather(manager) is False

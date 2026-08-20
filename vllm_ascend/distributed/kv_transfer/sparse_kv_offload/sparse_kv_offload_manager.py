@@ -371,20 +371,23 @@ class SparseKVOffloadManager:
         self.tp_group.barrier()
 
         # Populated in register_kv_caches via _init_cpu_gather_h2d().
-        # Resources are lazy-inited on first eager gather so ACL graph capture
-        # is not perturbed by extra NPU staging / host threads.
+        # Device staging is lazy-inited on first eager packed H2D so ACL graph
+        # capture is not perturbed by extra NPU buffers.
         self._enable_cpu_gather_h2d = False
-        self._gather_pool = None
-        self._host_gather_buf = None
+        self._packed_host_buf = None
+        self._packed_gva = 0
+        self._packed_nbytes = 0
         self._device_staging_buf = None
         self._cpu_gather_buffer_bytes = 0
         self._cpu_gather_threads = 0
-        self._gather_src_ptrs = None
-        self._gather_dst_ptrs = None
-        self._gather_sizes = None
-        self._gather_h2d_src = None
-        self._gather_h2d_dst = None
-        self._gather_h2d_size = None
+        self._packed_h2d_src_cpu = None
+        self._packed_h2d_dst_cpu = None
+        self._packed_h2d_size_cpu = None
+        self._packed_h2d_num_cpu = None
+        self._packed_h2d_src_npu = None
+        self._packed_h2d_dst_npu = None
+        self._packed_h2d_size_npu = None
+        self._packed_h2d_num_npu = None
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -780,85 +783,96 @@ class SparseKVOffloadManager:
         self._init_cpu_gather_h2d()
 
     def _init_cpu_gather_h2d(self) -> None:
-        """Optional C-scheme H2D: host gather -> contiguous H2D -> device scatter.
+        """Packed onload: TP0 gathers into GVA staging; all ranks sparse_copy H2D.
 
-        Used as an alternative to memfabric sparse_copy for Sparse KV Offload
-        onload. Copies run inside the captured host callback (same place as
-        LRU), using pybind aclrtMemcpy rather than torch.ops, so FULL graph
-        capture/replay can use gather.
+        CPU KV lives in the memfabric SHARED pool. Only TP0 can memcpy into a
+        GVA packed buffer. Every rank then issues one contiguous sparse_copy
+        H2D from that GVA plus a local D2D scatter into topk slots.
+        Device staging is allocated lazily (first eager packed H2D).
         """
         from vllm_ascend import envs
 
         self._enable_cpu_gather_h2d = bool(envs.VLLM_ASCEND_ENABLE_CPU_GATHER_H2D)
-        self._cpu_gather_buffer_bytes = int(envs.VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES)
         self._cpu_gather_threads = int(envs.VLLM_ASCEND_CPU_GATHER_THREADS)
+        max_packed = self.max_num_topk_rows * self.topk * (self.token_size_bytes_k + self.token_size_bytes_v)
+        self._cpu_gather_buffer_bytes = max(int(envs.VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES), int(max_packed))
         if not self._enable_cpu_gather_h2d:
             return
-        # Allocate before ACL graph capture. Copies run inside the captured
-        # host callback via pybind (not torch.ops), matching lru_resident_compact.
-        if not self._ensure_cpu_gather_resources():
-            logger.warning("CPU gather H2D requested but resource init failed; falling back to sparse_copy")
+
+        packed_gva = 0
+        if self.tp_rank == 0:
+            try:
+                self._packed_host_buf = offload.empty(
+                    [self._cpu_gather_buffer_bytes],
+                    dtype=torch.int8,
+                    pin_memory=True,
+                )
+                packed_gva = int(self._packed_host_buf.data_ptr())
+            except Exception as exc:
+                logger.warning("CPU gather H2D disabled: GVA packed staging alloc failed: %s", exc)
+                self._enable_cpu_gather_h2d = False
+                return
+
+        gva_tensor = torch.zeros([1], dtype=torch.int64, device="npu")
+        if self.tp_rank == 0:
+            gva_tensor[0] = packed_gva
+        self.tp_group.broadcast(gva_tensor, src=0)
+        self._packed_gva = int(gva_tensor[0].item())
+        if self._packed_gva == 0:
+            logger.warning("CPU gather H2D disabled: packed GVA is null")
             self._enable_cpu_gather_h2d = False
             return
         logger.info(
-            "Sparse KV offload CPU gather H2D enabled (host-callback, graph-safe): threads=%d, buffer_bytes=%d",
+            "Sparse KV offload packed H2D enabled (all ranks, sparse_copy n=1): "
+            "threads=%d, buffer_bytes=%d, packed_gva=0x%x",
             self._cpu_gather_threads,
             self._cpu_gather_buffer_bytes,
+            self._packed_gva,
         )
+
+    def _should_use_cpu_gather(self, capturing: bool) -> bool:
+        """Packed onload is eager-only. Graph capture/replay keeps discrete sparse_copy."""
+        return bool(self._enable_cpu_gather_h2d) and (not capturing) and self._packed_gva != 0
 
     def _ensure_cpu_gather_resources(self) -> bool:
-        """Allocate gather staging. Safe before capture; must not allocate during capture."""
-        from vllm_ascend.kv_offload.cpu_gather import CpuGatherPool
-
-        if self._gather_pool is not None:
+        """Allocate per-rank device staging and packed H2D descriptors."""
+        if self._device_staging_buf is not None:
             return True
+        try:
+            if torch.npu.is_current_stream_capturing():
+                return False
+        except Exception:
+            pass
 
-        max_entries = int(self.gvas_buffer_cpu.numel())
         device = self.topk_buffers_k[0].device
-        self._gather_pool = CpuGatherPool(num_threads=self._cpu_gather_threads)
-        self._host_gather_buf = torch.empty(
-            self._cpu_gather_buffer_bytes,
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
-        )
         self._device_staging_buf = torch.empty(
             self._cpu_gather_buffer_bytes,
             dtype=torch.uint8,
             device=device,
         )
-        self._gather_src_ptrs = torch.empty(max_entries, dtype=torch.int64, pin_memory=True)
-        self._gather_dst_ptrs = torch.empty(max_entries, dtype=torch.int64, pin_memory=True)
-        self._gather_sizes = torch.empty(max_entries, dtype=torch.int64, pin_memory=True)
-        self._gather_h2d_src = torch.empty(1, dtype=torch.int64, pin_memory=True)
-        self._gather_h2d_dst = torch.empty(1, dtype=torch.int64, pin_memory=True)
-        self._gather_h2d_size = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        self._packed_h2d_src_cpu = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        self._packed_h2d_dst_cpu = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        self._packed_h2d_size_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
+        self._packed_h2d_num_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
+        self._packed_h2d_src_npu = torch.empty(1, dtype=torch.int64, device=device)
+        self._packed_h2d_dst_npu = torch.empty(1, dtype=torch.int64, device=device)
+        self._packed_h2d_size_npu = torch.empty(1, dtype=torch.int32, device=device)
+        self._packed_h2d_num_npu = torch.empty(1, dtype=torch.int32, device=device)
         logger.info(
-            "Sparse KV offload CPU gather H2D resources allocated: threads=%d, buffer_bytes=%d",
-            self._cpu_gather_threads,
+            "Sparse KV offload packed H2D device staging allocated: buffer_bytes=%d",
             self._cpu_gather_buffer_bytes,
         )
         return True
 
-    def _submit_h2d_cpu_gather(self) -> bool:
-        """Submit H2D via CPU gather + contiguous H2D + D2D scatter.
-
-        Returns False when gather cannot be used (caller falls back to sparse_copy).
-        """
-        from vllm_ascend.kv_offload.cpu_gather import GatherItem, split_by_buffer_capacity
-
-        if not self._ensure_cpu_gather_resources():
-            return False
-        if self._gather_pool is None or self._host_gather_buf is None or self._device_staging_buf is None:
-            return False
-        if self._gather_dst_ptrs is None or self._gather_sizes is None:
-            return False
-        packed_h2d_d2d = getattr(self.sparse_kv_offload_cpp, "packed_h2d_d2d", None)
-        if packed_h2d_d2d is None:
+    def _tp0_pack_host_gather(self) -> bool:
+        """TP0 packs discrete GVA into shared staging. All ranks compute nbytes."""
+        packed_host_gather = getattr(self.sparse_kv_offload_cpp, "packed_host_gather", None)
+        if packed_host_gather is None or self._packed_gva == 0:
             return False
 
         num_entries = int(self.num_tokens_buffer_cpu.view(-1)[0].item())
         max_entries = int(self.gvas_buffer_cpu.numel())
+        self._packed_nbytes = 0
         if num_entries <= 0:
             return True
         if num_entries > max_entries:
@@ -869,57 +883,95 @@ class SparseKVOffloadManager:
             )
             return False
 
-        all_src = self.gvas_buffer_cpu[:num_entries]
-        all_dst = self.addr_buffer_cpu[:num_entries]
-        all_sizes = self.size_buffer_cpu[:num_entries].to(dtype=torch.int64)
-        ranges = split_by_buffer_capacity(all_sizes.numpy(), self._cpu_gather_buffer_bytes)
-        if not ranges:
+        sizes = self.size_buffer_cpu[:num_entries]
+        if int(sizes.max().item()) > self._cpu_gather_buffer_bytes:
+            return False
+        src = self.gvas_buffer_cpu[:num_entries]
+        dst = self.addr_buffer_cpu[:num_entries]
+        valid = (sizes > 0) & (src != 0) & (dst != 0)
+        nbytes = int(sizes[valid].sum().item()) if bool(valid.any()) else 0
+        if nbytes > self._cpu_gather_buffer_bytes:
+            return False
+        self._packed_nbytes = nbytes
+        if nbytes == 0:
+            return True
+        if self.tp_rank != 0:
+            return True
+
+        packed = int(
+            packed_host_gather(
+                self.gvas_buffer_cpu,
+                self.addr_buffer_cpu,
+                self.size_buffer_cpu,
+                num_entries,
+                self._packed_gva,
+                self._cpu_gather_buffer_bytes,
+                self._cpu_gather_threads,
+            )
+        )
+        if packed < 0:
+            return False
+        self._packed_nbytes = packed
+        return True
+
+    def _submit_packed_sparse_h2d_and_d2d(self) -> bool:
+        """All ranks: packed H2D then local D2D scatter.
+
+        TP0 uses ACL contiguous H2D from local GVA. Other ranks use memfabric
+        sparse_copy n=1 from the same packed GVA.
+        """
+        if not self._ensure_cpu_gather_resources():
+            return False
+        if self._device_staging_buf is None or self._packed_h2d_src_npu is None:
+            return False
+        packed_d2d_scatter = getattr(self.sparse_kv_offload_cpp, "packed_d2d_scatter", None)
+        if packed_d2d_scatter is None:
             return False
 
-        host_base = int(self._host_gather_buf.data_ptr())
+        nbytes = int(self._packed_nbytes)
+        if nbytes <= 0:
+            return True
+
+        device = self.topk_buffers_k[0].device
         device_base = int(self._device_staging_buf.data_ptr())
-
-        for begin, end in ranges:
-            chunk_src = all_src[begin:end].tolist()
-            chunk_dst = all_dst[begin:end].tolist()
-            chunk_sizes = all_sizes[begin:end].tolist()
-            items: list[GatherItem] = []
-            offset = 0
-            for src_ptr, dst_ptr, size in zip(chunk_src, chunk_dst, chunk_sizes):
-                size_i = int(size)
-                src_i = int(src_ptr)
-                dst_i = int(dst_ptr)
-                if size_i <= 0 or src_i == 0 or dst_i == 0:
-                    continue
-                items.append(GatherItem(src_ptr=src_i, dst_offset=offset, size=size_i))
-                offset += size_i
-            if not items:
-                continue
-
-            self._gather_pool.gather(items, host_base)
-            item_idx = 0
-            for src_ptr, dst_ptr, size in zip(chunk_src, chunk_dst, chunk_sizes):
-                size_i = int(size)
-                src_i = int(src_ptr)
-                dst_i = int(dst_ptr)
-                if size_i <= 0 or src_i == 0 or dst_i == 0:
-                    continue
-                self._gather_dst_ptrs[item_idx] = dst_i
-                self._gather_sizes[item_idx] = size_i
-                item_idx += 1
-            if item_idx <= 0:
-                continue
-            # aclrtMemcpy (sync) via the same pybind path as LRU. Do not use
-            # torch.ops here: boxed JIT memcpy segfaults under ACL graph.
-            packed_h2d_d2d(
-                host_base,
-                device_base,
-                offset,
-                self._gather_dst_ptrs[:item_idx],
-                self._gather_sizes[:item_idx],
+        if self.tp_rank == 0:
+            packed_contiguous_h2d = getattr(self.sparse_kv_offload_cpp, "packed_contiguous_h2d", None)
+            if packed_contiguous_h2d is None:
+                return False
+            packed_contiguous_h2d(self._packed_gva, device_base, nbytes)
+        else:
+            self._packed_h2d_src_cpu[0] = self._packed_gva
+            self._packed_h2d_dst_cpu[0] = device_base
+            self._packed_h2d_size_cpu[0] = nbytes
+            self._packed_h2d_num_cpu[0] = 1
+            self._packed_h2d_src_npu.copy_(self._packed_h2d_src_cpu)
+            self._packed_h2d_dst_npu.copy_(self._packed_h2d_dst_cpu)
+            self._packed_h2d_size_npu.copy_(self._packed_h2d_size_cpu)
+            self._packed_h2d_num_npu.copy_(self._packed_h2d_num_cpu)
+            result = offload.sparse_copy(
+                self._packed_h2d_src_npu,
+                self._packed_h2d_dst_npu,
+                self._packed_h2d_size_npu,
+                self._packed_h2d_num_npu,
+                device,
             )
+            if result not in (None, 0):
+                logger.warning_once("packed sparse_copy H2D failed with result=%s", result)
+                return False
+            # memfabric DMA is not issued on the current PyTorch NPU stream.
+            torch.npu.synchronize()
 
-        return True
+        num_entries = int(self.num_tokens_buffer_cpu.view(-1)[0].item())
+        return bool(
+            packed_d2d_scatter(
+                self.gvas_buffer_cpu,
+                self.addr_buffer_cpu,
+                self.size_buffer_cpu,
+                num_entries,
+                device_base,
+                self._cpu_gather_buffer_bytes,
+            )
+        )
 
     def offload_new_kv(
         self,
@@ -1052,6 +1104,8 @@ class SparseKVOffloadManager:
                 non_blocking=capturing,
             )
 
+        use_cpu_gather = self._should_use_cpu_gather(capturing)
+
         if skip_topk:
             assert layer_id > 0, "No previous layer to reuse."
             gvas_offset = self.gvas_k_bases[layer_id] - self.gvas_k_bases[layer_id - 1]
@@ -1062,9 +1116,12 @@ class SparseKVOffloadManager:
             assert self.addr_v_bases[layer_id] - self.addr_v_bases[layer_id - 1] == addr_offset, (
                 "k/v addr base delta mismatch."
             )
-            self.gvas_buffer_npu += gvas_offset
-            self.addr_buffer_npu += addr_offset
-            use_cpu_gather = False
+            if use_cpu_gather:
+                self.gvas_buffer_cpu += gvas_offset
+                self.addr_buffer_cpu += addr_offset
+            else:
+                self.gvas_buffer_npu += gvas_offset
+                self.addr_buffer_npu += addr_offset
         else:
             if token_to_req_npu is not None:
                 block_table_cpu = self.block_table_expanded_cpu[:num_tokens]
@@ -1122,20 +1179,31 @@ class SparseKVOffloadManager:
             else:
                 self._onload_topk_kv_cpu(args)
 
-            # Gather copies are issued inside `_onload_topk_kv_cpu` (host
-            # callback), so FULL graph capture/replay can use them.
-            use_cpu_gather = bool(self._enable_cpu_gather_h2d)
             if not use_cpu_gather:
                 self.sparse_copy_args_buffer_npu.copy_(
                     self.sparse_copy_args_buffer_cpu,
                     non_blocking=capturing,
                 )
 
+        if use_cpu_gather and not self._tp0_pack_host_gather():
+            use_cpu_gather = False
+            self.sparse_copy_args_buffer_npu.copy_(
+                self.sparse_copy_args_buffer_cpu,
+                non_blocking=False,
+            )
+
         if self.tp_size > 1:
-            # Make sure that tp0 d2h is finished before other tp's h2d.
+            # TP0 pack (and decode D2H) must complete before other ranks H2D.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
 
+        if use_cpu_gather:
+            if not self._submit_packed_sparse_h2d_and_d2d():
+                use_cpu_gather = False
+                self.sparse_copy_args_buffer_npu.copy_(
+                    self.sparse_copy_args_buffer_cpu,
+                    non_blocking=False,
+                )
         if not use_cpu_gather:
             offload.sparse_copy(
                 self.gvas_buffer_npu,
@@ -1182,7 +1250,7 @@ class SparseKVOffloadManager:
             addr_buffer,
             size_buffer,
             num_tokens_buffer,
-            layer_id,
+            _,
         ) = args
         self.sparse_kv_offload_cpp.lru_resident_compact(
             lru_req_ids_ptr,
@@ -1226,8 +1294,6 @@ class SparseKVOffloadManager:
             size_buffer,
             num_tokens_buffer,
         )
-        if self._enable_cpu_gather_h2d:
-            self._submit_h2d_cpu_gather()
 
 
 _SPARSE_KV_OFFLOAD_MANAGER: SparseKVOffloadManager | None = None

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <string>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
@@ -327,40 +328,121 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
   return num_tokens_to_load_sum;
 }
 
-// Graph-safe packed onload: one contiguous H2D plus D2D scatter.
-// Called from the captured host callback (same as lru_resident_compact), not
-// via torch.ops, so ACL graph does not record boxed JIT memcpy operators.
-void packed_h2d_d2d(int64_t host_base, int64_t device_base, int64_t nbytes,
-                    const at::Tensor& dst_ptrs, const at::Tensor& sizes) {
-  TORCH_CHECK(dst_ptrs.device().is_cpu(), "packed_h2d_d2d dst_ptrs must be CPU");
-  TORCH_CHECK(sizes.device().is_cpu(), "packed_h2d_d2d sizes must be CPU");
-  TORCH_CHECK(dst_ptrs.scalar_type() == at::kLong, "packed_h2d_d2d dst_ptrs must be int64");
-  TORCH_CHECK(sizes.scalar_type() == at::kLong, "packed_h2d_d2d sizes must be int64");
-  TORCH_CHECK(dst_ptrs.size(0) == sizes.size(0), "packed_h2d_d2d dst/size length mismatch");
+// Pack discrete host blocks into a contiguous GVA/host staging buffer (TP0).
+// Returns packed nbytes, or -1 when a single item / total exceeds buffer_bytes.
+int64_t packed_host_gather(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs, const at::Tensor& sizes,
+                           int64_t num_entries, int64_t host_base, int64_t buffer_bytes, int32_t num_threads) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_host_gather pointer/size tensors must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_host_gather src/dst must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_host_gather sizes must be int32");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_host_gather num_entries exceeds tensor length");
+  TORCH_CHECK(buffer_bytes > 0, "packed_host_gather buffer_bytes must be > 0");
+  TORCH_CHECK(host_base != 0, "packed_host_gather null staging ptr");
 
-  if (nbytes > 0) {
-    TORCH_CHECK(host_base != 0 && device_base != 0, "packed_h2d_d2d null staging ptr");
-    aclError ret = aclrtMemcpy(reinterpret_cast<void*>(device_base), static_cast<size_t>(nbytes),
-                               reinterpret_cast<const void*>(host_base), static_cast<size_t>(nbytes),
-                               ACL_MEMCPY_HOST_TO_DEVICE);
-    TORCH_CHECK(ret == ACL_SUCCESS, "packed_h2d_d2d H2D failed with ", ret, ", nbytes=", nbytes);
+  if (num_entries <= 0) {
+    return 0;
   }
 
-  const int64_t n = dst_ptrs.size(0);
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
   const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
-  const int64_t* sz = sizes.data_ptr<int64_t>();
-  int64_t running = 0;
-  for (int64_t i = 0; i < n; ++i) {
-    const int64_t copy_size = sz[i];
-    if (copy_size <= 0 || dst[i] == 0) {
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+
+  int32_t max_item = 0;
+  int64_t used = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    max_item = std::max(max_item, sz[i]);
+    if (sz[i] > 0 && src[i] != 0 && dst[i] != 0) {
+      used += sz[i];
+    }
+  }
+  if (max_item > buffer_bytes || used > buffer_bytes) {
+    return -1;
+  }
+  if (used == 0) {
+    return 0;
+  }
+
+  char* host = reinterpret_cast<char*>(host_base);
+  const int omp_threads = std::max(num_threads, 1);
+  std::vector<int64_t> pack_src;
+  std::vector<int64_t> pack_off;
+  std::vector<int32_t> pack_sz;
+  pack_src.reserve(static_cast<size_t>(num_entries));
+  pack_off.reserve(static_cast<size_t>(num_entries));
+  pack_sz.reserve(static_cast<size_t>(num_entries));
+  int64_t offset = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (sz[i] <= 0 || src[i] == 0 || dst[i] == 0) {
       continue;
     }
-    aclError ret = aclrtMemcpy(reinterpret_cast<void*>(dst[i]), static_cast<size_t>(copy_size),
-                               reinterpret_cast<const void*>(device_base + running),
-                               static_cast<size_t>(copy_size), ACL_MEMCPY_DEVICE_TO_DEVICE);
-    TORCH_CHECK(ret == ACL_SUCCESS, "packed_h2d_d2d D2D failed at ", i, " with ", ret);
-    running += copy_size;
+    pack_src.push_back(src[i]);
+    pack_off.push_back(offset);
+    pack_sz.push_back(sz[i]);
+    offset += sz[i];
   }
+
+  const int64_t n_pack = static_cast<int64_t>(pack_src.size());
+  const int n_threads = std::max(1, static_cast<int>(std::min(static_cast<int64_t>(omp_threads), n_pack)));
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+  for (int64_t i = 0; i < n_pack; ++i) {
+    std::memcpy(host + pack_off[i], reinterpret_cast<const void*>(pack_src[i]), static_cast<size_t>(pack_sz[i]));
+  }
+  return used;
+}
+
+bool packed_contiguous_h2d(int64_t host_base, int64_t device_base, int64_t nbytes) {
+  if (nbytes <= 0) {
+    return true;
+  }
+  TORCH_CHECK(host_base != 0 && device_base != 0, "packed_contiguous_h2d null staging ptr");
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  aclError ret = aclrtMemcpyAsync(reinterpret_cast<void*>(device_base), static_cast<size_t>(nbytes),
+                                  reinterpret_cast<const void*>(host_base), static_cast<size_t>(nbytes),
+                                  ACL_MEMCPY_HOST_TO_DEVICE, stream);
+  TORCH_CHECK(ret == ACL_SUCCESS, "packed_contiguous_h2d H2D failed with ", ret, ", nbytes=", nbytes);
+  return true;
+}
+
+// Async D2D scatter from packed device staging into discrete resident KV slots.
+// Skip rules must match packed_host_gather (size<=0 / src==0 / dst==0).
+bool packed_d2d_scatter(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs, const at::Tensor& sizes,
+                        int64_t num_entries, int64_t device_base, int64_t buffer_bytes) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_d2d_scatter pointer/size tensors must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_d2d_scatter src/dst must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_d2d_scatter sizes must be int32");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_d2d_scatter num_entries exceeds tensor length");
+  TORCH_CHECK(device_base != 0, "packed_d2d_scatter null device staging ptr");
+
+  if (num_entries <= 0) {
+    return true;
+  }
+
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  int64_t running = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (sz[i] <= 0 || src[i] == 0 || dst[i] == 0) {
+      continue;
+    }
+    const size_t copy_size = static_cast<size_t>(sz[i]);
+    if (running + sz[i] > buffer_bytes) {
+      return false;
+    }
+    aclError ret = aclrtMemcpyAsync(reinterpret_cast<void*>(dst[i]), copy_size,
+                                    reinterpret_cast<const void*>(device_base + running), copy_size,
+                                    ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    TORCH_CHECK(ret == ACL_SUCCESS, "packed_d2d_scatter D2D failed at ", i, " with ", ret);
+    running += sz[i];
+  }
+  return true;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -369,6 +451,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
-  m.def("packed_h2d_d2d", &packed_h2d_d2d,
-        "Contiguous H2D plus D2D scatter; safe to call from ACL graph host callback");
+  m.def("packed_host_gather", &packed_host_gather,
+        "OpenMP gather of discrete host/GVA blocks into contiguous staging");
+  m.def("packed_contiguous_h2d", &packed_contiguous_h2d,
+        "One async contiguous H2D of packed staging on the current NPU stream");
+  m.def("packed_d2d_scatter", &packed_d2d_scatter,
+        "Async D2D scatter from packed device staging into discrete KV slots");
 }
