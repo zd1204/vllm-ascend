@@ -4,9 +4,11 @@
 #include <iostream>
 #include <chrono>
 #include <string>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
+#include <cstddef>
 #include <numeric>
 #include <ATen/Parallel.h>
 #include <torch/script.h>
@@ -327,10 +329,156 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
   return num_tokens_to_load_sum;
 }
 
+// Pack discrete host blocks into a contiguous GVA/host staging buffer (TP0).
+// Returns packed nbytes, or -1 when a single item / total exceeds buffer_bytes.
+int64_t packed_host_gather(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs, const at::Tensor& sizes,
+                           int64_t num_entries, int64_t host_base, int64_t buffer_bytes, int32_t num_threads) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_host_gather pointer/size tensors must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_host_gather src/dst must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_host_gather sizes must be int32");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_host_gather num_entries exceeds tensor length");
+  TORCH_CHECK(buffer_bytes > 0, "packed_host_gather buffer_bytes must be > 0");
+  TORCH_CHECK(host_base != 0, "packed_host_gather null staging ptr");
+
+  if (num_entries <= 0) {
+    return 0;
+  }
+
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+
+  int32_t max_item = 0;
+  int64_t used = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    max_item = std::max(max_item, sz[i]);
+    if (sz[i] > 0 && src[i] != 0 && dst[i] != 0) {
+      used += sz[i];
+    }
+  }
+  if (max_item > buffer_bytes || used > buffer_bytes) {
+    return -1;
+  }
+  if (used == 0) {
+    return used;
+  }
+
+  char* host = reinterpret_cast<char*>(host_base);
+  const int omp_threads = std::max(num_threads, 1);
+  std::vector<int64_t> pack_src;
+  std::vector<int64_t> pack_off;
+  std::vector<int32_t> pack_sz;
+  pack_src.reserve(static_cast<size_t>(num_entries));
+  pack_off.reserve(static_cast<size_t>(num_entries));
+  pack_sz.reserve(static_cast<size_t>(num_entries));
+  int64_t offset = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (sz[i] <= 0 || src[i] == 0 || dst[i] == 0) {
+      continue;
+    }
+    pack_src.push_back(src[i]);
+    pack_off.push_back(offset);
+    pack_sz.push_back(sz[i]);
+    offset += sz[i];
+  }
+
+  const int64_t n_pack = static_cast<int64_t>(pack_src.size());
+  const int n_threads = std::max(1, static_cast<int>(std::min(static_cast<int64_t>(omp_threads), n_pack)));
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+  for (int64_t i = 0; i < n_pack; ++i) {
+    std::memcpy(host + pack_off[i], reinterpret_cast<const void*>(pack_src[i]), static_cast<size_t>(pack_sz[i]));
+  }
+  return used;
+}
+
+// One aclrtMemcpyBatchAsync. dsts/srcs must be void** (arrays of pointers),
+// not an int64 address tensor cast to void**.
+static bool memcpy_batch_async(void** dsts, size_t* dest_maxs, void** srcs, size_t* copy_sizes, size_t num_batches,
+                               aclrtMemLocationType src_type, aclrtMemLocationType dst_type) {
+  if (num_batches == 0) {
+    return true;
+  }
+  int32_t device_id = 0;
+  TORCH_CHECK(aclrtGetDevice(&device_id) == ACL_SUCCESS, "aclrtGetDevice failed");
+  aclrtMemcpyBatchAttr attr{};
+  attr.srcLoc.type = src_type;
+  attr.srcLoc.id = (src_type == ACL_MEM_LOCATION_TYPE_DEVICE) ? static_cast<uint32_t>(device_id) : 0U;
+  attr.dstLoc.type = dst_type;
+  attr.dstLoc.id = (dst_type == ACL_MEM_LOCATION_TYPE_DEVICE) ? static_cast<uint32_t>(device_id) : 0U;
+  size_t attr_index = 0;
+  size_t fail_index = SIZE_MAX;
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const aclError ret = aclrtMemcpyBatchAsync(dsts, dest_maxs, srcs, copy_sizes, num_batches, &attr, &attr_index,
+                                             /*numAttrs=*/1, &fail_index, stream);
+  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtMemcpyBatchAsync failed with ", ret, ", failIndex=", fail_index,
+              ", n=", num_batches);
+  return true;
+}
+
+bool packed_contiguous_h2d(int64_t host_base, int64_t device_base, int64_t nbytes) {
+  if (nbytes <= 0) {
+    return true;
+  }
+  TORCH_CHECK(host_base != 0 && device_base != 0, "packed_contiguous_h2d null staging ptr");
+  void* dst = reinterpret_cast<void*>(device_base);
+  void* src = reinterpret_cast<void*>(host_base);
+  size_t copy_size = static_cast<size_t>(nbytes);
+  return memcpy_batch_async(&dst, &copy_size, &src, &copy_size, 1, ACL_MEM_LOCATION_TYPE_HOST,
+                            ACL_MEM_LOCATION_TYPE_DEVICE);
+}
+
+// Fill sparse_copy src pointers as packed_base + packed_offset (same skip
+// rules as gather). packed_base may be a SHARED GVA or a device staging ptr.
+bool packed_fill_scatter_srcs(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs, const at::Tensor& sizes,
+                              int64_t num_entries, int64_t device_base, int64_t buffer_bytes,
+                              at::Tensor& scatter_srcs) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_fill_scatter_srcs pointer/size tensors must be CPU");
+  TORCH_CHECK(scatter_srcs.device().is_cpu(), "packed_fill_scatter_srcs scatter_srcs must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_fill_scatter_srcs src/dst must be int64");
+  TORCH_CHECK(scatter_srcs.scalar_type() == at::kLong, "packed_fill_scatter_srcs scatter_srcs must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_fill_scatter_srcs sizes must be int32");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_fill_scatter_srcs num_entries exceeds tensor length");
+  TORCH_CHECK(scatter_srcs.size(0) >= num_entries, "packed_fill_scatter_srcs scatter_srcs too short");
+  TORCH_CHECK(device_base != 0, "packed_fill_scatter_srcs null packed base ptr");
+
+  if (num_entries <= 0) {
+    return true;
+  }
+
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+  int64_t* out = scatter_srcs.data_ptr<int64_t>();
+  int64_t running = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (sz[i] <= 0 || src[i] == 0 || dst[i] == 0) {
+      out[i] = 0;
+      continue;
+    }
+    if (running + sz[i] > buffer_bytes) {
+      return false;
+    }
+    out[i] = device_base + running;
+    running += sz[i];
+  }
+  return true;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  namespace py = pybind11;
   m.def("lru_resident_compact", &lru_resident_compact,
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
+  m.def("packed_host_gather", &packed_host_gather,
+        "OpenMP gather of discrete host/GVA blocks into contiguous staging");
+  m.def("packed_contiguous_h2d", &packed_contiguous_h2d,
+        "One batched contiguous H2D of packed staging on the current NPU stream");
+  m.def("packed_fill_scatter_srcs", &packed_fill_scatter_srcs,
+        "Fill device src pointers for packed sparse_copy D2D scatter");
 }

@@ -370,6 +370,16 @@ class SparseKVOffloadManager:
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
 
+        # Populated in register_kv_caches via _init_cpu_gather_h2d().
+        # Packed path only needs the SHARED host GVA; graph NPU ops stay the
+        # same as discrete (one descriptor copy_ + one sparse_copy).
+        self._enable_cpu_gather_h2d = False
+        self._packed_host_buf = None
+        self._packed_gva = 0
+        self._packed_nbytes = 0
+        self._cpu_gather_buffer_bytes = 0
+        self._cpu_gather_threads = 0
+
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
         ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
@@ -761,6 +771,145 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+        self._init_cpu_gather_h2d()
+
+    def _init_cpu_gather_h2d(self) -> None:
+        """Packed onload: TP0 gathers discrete GVA into one SHARED packed GVA.
+
+        After pack, host callback rewrites sparse_copy srcs to packed_gva+offset.
+        Graph/eager NPU path stays identical to discrete: one descriptor copy_
+        and one sparse_copy into local topk slots.
+        """
+        from vllm_ascend import envs
+
+        self._enable_cpu_gather_h2d = bool(envs.VLLM_ASCEND_ENABLE_CPU_GATHER_H2D)
+        self._cpu_gather_threads = int(envs.VLLM_ASCEND_CPU_GATHER_THREADS)
+        max_packed = self.max_num_topk_rows * self.topk * (self.token_size_bytes_k + self.token_size_bytes_v)
+        self._cpu_gather_buffer_bytes = max(int(envs.VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES), int(max_packed))
+        if not self._enable_cpu_gather_h2d:
+            return
+
+        packed_gva = 0
+        if self.tp_rank == 0:
+            try:
+                self._packed_host_buf = offload.empty(
+                    [self._cpu_gather_buffer_bytes],
+                    dtype=torch.int8,
+                    pin_memory=True,
+                )
+                packed_gva = int(self._packed_host_buf.data_ptr())
+            except Exception as exc:
+                logger.warning("CPU gather H2D disabled: GVA packed staging alloc failed: %s", exc)
+                self._enable_cpu_gather_h2d = False
+                return
+
+        gva_tensor = torch.zeros([1], dtype=torch.int64, device="npu")
+        if self.tp_rank == 0:
+            gva_tensor[0] = packed_gva
+        self.tp_group.broadcast(gva_tensor, src=0)
+        self._packed_gva = int(gva_tensor[0].item())
+        if self._packed_gva == 0:
+            logger.warning("CPU gather H2D disabled: packed GVA is null")
+            self._enable_cpu_gather_h2d = False
+            return
+        logger.info(
+            "Sparse KV offload packed H2D enabled (pack then one sparse_copy): "
+            "threads=%d, buffer_bytes=%d, packed_gva=0x%x",
+            self._cpu_gather_threads,
+            self._cpu_gather_buffer_bytes,
+            self._packed_gva,
+        )
+
+    def _should_use_cpu_gather(self, capturing: bool = False) -> bool:
+        """Packed onload for eager and ACL graph when packed GVA is ready."""
+        del capturing  # Graph capture/replay uses the same packed host path.
+        return bool(self._enable_cpu_gather_h2d) and self._packed_gva != 0
+
+    def _tp0_pack_host_gather(self) -> bool:
+        """TP0 packs discrete GVA into shared staging. All ranks compute nbytes."""
+        packed_host_gather = getattr(self.sparse_kv_offload_cpp, "packed_host_gather", None)
+        if packed_host_gather is None or self._packed_gva == 0:
+            return False
+
+        num_entries = int(self.num_tokens_buffer_cpu.view(-1)[0].item())
+        max_entries = int(self.gvas_buffer_cpu.numel())
+        self._packed_nbytes = 0
+        if num_entries <= 0:
+            return True
+        if num_entries > max_entries:
+            logger.warning_once(
+                "CPU gather H2D skipped: num_entries=%s exceeds workspace %s",
+                num_entries,
+                max_entries,
+            )
+            return False
+
+        sizes = self.size_buffer_cpu[:num_entries]
+        if int(sizes.max().item()) > self._cpu_gather_buffer_bytes:
+            return False
+        src = self.gvas_buffer_cpu[:num_entries]
+        dst = self.addr_buffer_cpu[:num_entries]
+        valid = (sizes > 0) & (src != 0) & (dst != 0)
+        nbytes = int(sizes[valid].sum().item()) if bool(valid.any()) else 0
+        if nbytes > self._cpu_gather_buffer_bytes:
+            return False
+        self._packed_nbytes = nbytes
+        if nbytes == 0:
+            return True
+        if self.tp_rank != 0:
+            return True
+
+        packed = int(
+            packed_host_gather(
+                self.gvas_buffer_cpu,
+                self.addr_buffer_cpu,
+                self.size_buffer_cpu,
+                num_entries,
+                self._packed_gva,
+                self._cpu_gather_buffer_bytes,
+                self._cpu_gather_threads,
+            )
+        )
+        if packed < 0:
+            return False
+        self._packed_nbytes = packed
+        return True
+
+    def _disable_packed_transfer(self) -> None:
+        """Make the recorded discrete sparse_copy a no-op (overflow / pack failure)."""
+        self._packed_nbytes = 0
+        num_entries = int(self.num_tokens_buffer_cpu.view(-1)[0].item())
+        if num_entries > 0:
+            self.size_buffer_cpu[:num_entries].fill_(0)
+
+    def _prepare_packed_onload_cpu(self) -> None:
+        """Host-callback: TP0 pack, then rewrite GVA srcs to packed_gva+offset."""
+        if self._packed_gva == 0:
+            return
+        if not self._tp0_pack_host_gather():
+            self._disable_packed_transfer()
+            return
+        if int(self._packed_nbytes) <= 0:
+            return
+        packed_fill_scatter_srcs = getattr(self.sparse_kv_offload_cpp, "packed_fill_scatter_srcs", None)
+        if packed_fill_scatter_srcs is None:
+            self._disable_packed_transfer()
+            return
+        num_entries = int(self.num_tokens_buffer_cpu.view(-1)[0].item())
+        if num_entries > int(self.gvas_buffer_cpu.numel()):
+            self._disable_packed_transfer()
+            return
+        if not packed_fill_scatter_srcs(
+            self.gvas_buffer_cpu,
+            self.addr_buffer_cpu,
+            self.size_buffer_cpu,
+            num_entries,
+            self._packed_gva,
+            self._cpu_gather_buffer_bytes,
+            self.gvas_buffer_cpu,
+        ):
+            self._disable_packed_transfer()
+
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
@@ -892,7 +1041,10 @@ class SparseKVOffloadManager:
                 non_blocking=capturing,
             )
 
-        if skip_topk:
+        use_cpu_gather = self._should_use_cpu_gather()
+        # Packed srcs are packed_gva+offset, not discrete layer GVA, so skip_topk
+        # must not pointer-add the previous layer's descriptors.
+        if skip_topk and not use_cpu_gather:
             assert layer_id > 0, "No previous layer to reuse."
             gvas_offset = self.gvas_k_bases[layer_id] - self.gvas_k_bases[layer_id - 1]
             addr_offset = self.addr_k_bases[layer_id] - self.addr_k_bases[layer_id - 1]
@@ -961,12 +1113,16 @@ class SparseKVOffloadManager:
             else:
                 self._onload_topk_kv_cpu(args)
 
-            self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+            self.sparse_copy_args_buffer_npu.copy_(
+                self.sparse_copy_args_buffer_cpu,
+                non_blocking=capturing,
+            )
 
         if self.tp_size > 1:
-            # Make sure that tp0 d2h is finished before other tp's h2d.
+            # TP0 pack (and decode D2H) must complete before other ranks H2D.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
+
         offload.sparse_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
@@ -1012,7 +1168,7 @@ class SparseKVOffloadManager:
             addr_buffer,
             size_buffer,
             num_tokens_buffer,
-            layer_id,
+            _,
         ) = args
         self.sparse_kv_offload_cpp.lru_resident_compact(
             lru_req_ids_ptr,
@@ -1056,6 +1212,8 @@ class SparseKVOffloadManager:
             size_buffer,
             num_tokens_buffer,
         )
+        if self._should_use_cpu_gather():
+            self._prepare_packed_onload_cpu()
 
 
 _SPARSE_KV_OFFLOAD_MANAGER: SparseKVOffloadManager | None = None

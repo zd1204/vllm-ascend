@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from transformers import HunYuanVLProcessor
+try:
+    from transformers import HunYuanVLProcessor
+except ImportError:  # transformers < version that ships HunYuanVLProcessor
+    HunYuanVLProcessor = None  # type: ignore[misc, assignment]
 
 from vllm_ascend.utils import vllm_version_is
 
@@ -55,7 +58,7 @@ def _register_hunyuan_tokenizer_special_tokens(tokenizer: Any) -> None:
         )
 
 
-class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
+class _HunYuanVLProcessorCompat(HunYuanVLProcessor if HunYuanVLProcessor is not None else object):
     """Native processor with the legacy HunyuanOCR token schema restored."""
 
     def __init__(
@@ -66,6 +69,11 @@ class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
         cat_extra_token: bool = True,
         **kwargs: Any,
     ) -> None:
+        if HunYuanVLProcessor is None:
+            raise ImportError(
+                "transformers does not provide HunYuanVLProcessor; "
+                "upgrade transformers to use Hunyuan VL models."
+            )
         _register_hunyuan_tokenizer_special_tokens(tokenizer)
         super().__init__(
             image_processor=image_processor,
@@ -148,6 +156,10 @@ def _patch_image_token_wrapping(hunyuan_vision: Any) -> None:
 
 def install_hunyuan_vl_processor_compat() -> None:
     """Align both supported vLLM refs with Transformers 5.13 Hunyuan APIs."""
+    if HunYuanVLProcessor is None:
+        # Older transformers (e.g. 5.5.x) do not ship HunYuanVLProcessor.
+        # Skip silently so unrelated models (DeepSeek/Qwen/...) can still start.
+        return
     _remove_stale_registry_entries()
     from vllm.model_executor.models import hunyuan_vision as main_hunyuan_vision
 

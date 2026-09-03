@@ -161,65 +161,11 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
                         " (expected 0=H2D, 1=D2H, 2=D2D)");
     }
 
-    // =========================================================================
-    // path 1: aclrtMemcpyBatchAsync (CANN 8.5+)
-    // =========================================================================
-#if defined(CANN_MEMCPY_BATCH_ASYNC)
-    if (memcpy_kind != ACL_MEMCPY_DEVICE_TO_DEVICE) {
-        static_assert(sizeof(void*) == sizeof(int64_t),
-                      "void* and int64_t must be the same size");
-        static_assert(sizeof(size_t) == sizeof(int64_t),
-                      "size_t and int64_t must be the same size");
-
-        void** dst_arr = reinterpret_cast<void**>(
-            const_cast<int64_t*>(dst_data));
-        void** src_arr = reinterpret_cast<void**>(
-            const_cast<int64_t*>(src_data));
-        size_t* size_arr = reinterpret_cast<size_t*>(
-            const_cast<int64_t*>(size_data));
-        size_t* dest_maxs = size_arr;
-
-        // aclrtMemcpyBatchAttr uses srcLoc/dstLoc (aclrtMemLocation)
-        // to specify memory locations, not aclrtMemcpyKind.
-        int32_t device_id = 0;
-        aclrtGetDevice(&device_id);
-
-        aclrtMemLocation host_loc = {};
-        host_loc.type = ACL_MEM_LOCATION_TYPE_HOST;
-        host_loc.id = 0;
-
-        aclrtMemLocation device_loc = {};
-        device_loc.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-        device_loc.id = device_id;
-
-        aclrtMemcpyBatchAttr attr = {};
-        if (memcpy_kind == ACL_MEMCPY_HOST_TO_DEVICE) {
-            attr.srcLoc = host_loc;
-            attr.dstLoc = device_loc;
-        } else {  // ACL_MEMCPY_DEVICE_TO_HOST
-            attr.srcLoc = device_loc;
-            attr.dstLoc = host_loc;
-        }
-
-        size_t attrs_index = 0;
-        size_t fail_index = 0;
-
-        aclError result = aclrtMemcpyBatchAsync(
-            dst_arr, dest_maxs, src_arr, size_arr,
-            static_cast<size_t>(n),
-            &attr, &attrs_index, 1,
-            &fail_index, stream);
-
-        TORCH_CHECK(result == ACL_SUCCESS,
-                    "aclrtMemcpyBatchAsync failed at index ", fail_index,
-                    " with error code ", result);
-        return;
-    }
-#endif
-
-    // =========================================================================
-    // path 2: aclrtMemcpyAsync
-    // =========================================================================
+    // Always use aclrtMemcpyAsync in a loop. src_ptrs/dst_ptrs are flat int64
+    // arrays of raw addresses (one value per block), NOT arrays of void*.
+    // aclrtMemcpyBatchAsync expects void** pointer arrays; feeding int64 values
+    // directly causes segfaults on H2D/D2H (CANN batch path must not be used
+    // with this tensor layout).
     for (int64_t i = 0; i < n; i++) {
         void* dst = reinterpret_cast<void*>(dst_data[i]);
         const void* src = reinterpret_cast<const void*>(src_data[i]);
@@ -240,6 +186,52 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
                     ", dst=", dst_data[i],
                     ", size=", size_data[i]);
     }
+}
+
+// Contiguous byte-level async memcpy on the current NPU stream.
+// Used by CPU-gather H2D (C-scheme): one large H2D after host gather, and
+// reusable for other contiguous host/device byte copies.
+// direction: 0=H2D, 1=D2H, 2=D2D
+void memcpy_contiguous_async(int64_t src_ptr,
+                             int64_t dst_ptr,
+                             int64_t nbytes,
+                             int64_t direction) {
+    if (nbytes == 0) {
+        return;
+    }
+    TORCH_CHECK(nbytes > 0, "memcpy_contiguous_async: nbytes must be >= 0");
+    TORCH_CHECK(src_ptr != 0, "memcpy_contiguous_async: src_ptr is null");
+    TORCH_CHECK(dst_ptr != 0, "memcpy_contiguous_async: dst_ptr is null");
+
+    aclrtMemcpyKind memcpy_kind;
+    switch (direction) {
+        case 0:
+            memcpy_kind = ACL_MEMCPY_HOST_TO_DEVICE;
+            break;
+        case 1:
+            memcpy_kind = ACL_MEMCPY_DEVICE_TO_HOST;
+            break;
+        case 2:
+            memcpy_kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "memcpy_contiguous_async: invalid direction ", direction,
+                        " (expected 0=H2D, 1=D2H, 2=D2D)");
+    }
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    const size_t copy_size = static_cast<size_t>(nbytes);
+    aclError ret = aclrtMemcpyAsync(
+        reinterpret_cast<void*>(dst_ptr),
+        copy_size,
+        reinterpret_cast<const void*>(src_ptr),
+        copy_size,
+        memcpy_kind,
+        stream);
+    TORCH_CHECK(ret == ACL_SUCCESS,
+                "memcpy_contiguous_async: aclrtMemcpyAsync failed with error ",
+                ret, ", src=", src_ptr, ", dst=", dst_ptr, ", nbytes=", nbytes);
 }
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
@@ -2169,6 +2161,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // internally submits async memcpy on the current NPU stream.
     ops.def("swap_blocks_batch(Tensor x, Tensor y, Tensor z, int direction) -> ()");
     ops.impl("swap_blocks_batch", torch::kCPU, &vllm_ascend::swap_blocks_batch);
+
+    // Contiguous large H2D/D2H/D2D byte copy on the current NPU stream.
+    // Pointers are raw addresses (host or device) expressed as int64.
+    // Register on CPU and PrivateUse1: scalar-only ops inherit the active
+    // device dispatch key, so NPU-context calls need a PrivateUse1 kernel too.
+    ops.def("memcpy_contiguous_async(int src_ptr, int dst_ptr, int nbytes, int direction) -> ()");
+    ops.impl("memcpy_contiguous_async", torch::kCPU, &vllm_ascend::memcpy_contiguous_async);
+    ops.impl("memcpy_contiguous_async", torch::kPrivateUse1, &vllm_ascend::memcpy_contiguous_async);
     ops.def("device_print(str msg) -> ()");
     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));

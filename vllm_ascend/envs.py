@@ -100,6 +100,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to use packed H2D for Sparse KV Offload decode onload.
+    # 0: disable (default), discrete memfabric sparse_copy from random GVA.
+    # 1: TP0 OpenMP-gathers discrete GVA blocks into a SHARED packed buffer,
+    #    then all ranks issue the same discrete sparse_copy whose srcs are
+    #    packed_gva+offset (sequential GVA). Graph capture/replay records the
+    #    same descriptor copy_ + one sparse_copy as the discrete path; pack
+    #    runs inside the LRU host callback.
+    "VLLM_ASCEND_ENABLE_CPU_GATHER_H2D": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CPU_GATHER_H2D", "0"))),
+    # Number of OpenMP threads for TP0 host packing. Valid range: >= 1.
+    # Default: 4. Setting this to 1 serializes host packing and is slower.
+    "VLLM_ASCEND_CPU_GATHER_THREADS": lambda: max(1, int(os.getenv("VLLM_ASCEND_CPU_GATHER_THREADS", "4"))),
+    # Floor for packed host GVA size. Actual buffer is
+    # max(this, max_num_topk_rows * topk * (token_k + token_v)). Overflow in
+    # the host callback is a no-op (size=0); there is no graph-path fallback.
+    # Default: 8 MiB.
+    "VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES": lambda: max(
+        4096, int(os.getenv("VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES", str(8 * 1024 * 1024)))
+    ),
 }
 
 # end-env-vars-definition
