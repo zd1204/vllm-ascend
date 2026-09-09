@@ -104,6 +104,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to use CPU-gather packed H2D for Sparse KV Offload decode onload.
+    # 0: disable (default), discrete memfabric sparse_copy from random GVA.
+    # 1: TP0 OpenMP-gathers discrete host blocks into one pinned packed buffer,
+    #    issues a single contiguous H2D into an NPU staging buffer, then
+    #    scatters into topk slots with index_copy_ (D2D). The onload hot path
+    #    no longer calls memfabric sparse_copy. For TP > 1, TP0 broadcasts
+    #    the staging buffer over HCCL before each rank scatters locally.
+    #    ACL graph capture/replay falls back to the discrete memfabric path.
+    "VLLM_ASCEND_ENABLE_CPU_GATHER_H2D": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CPU_GATHER_H2D", "0"))),
+    # Number of OpenMP threads for TP0 host packing. Valid range: >= 1.
+    # Default: 4. Setting this to 1 serializes host packing and is slower.
+    "VLLM_ASCEND_CPU_GATHER_THREADS": lambda: max(1, int(os.getenv("VLLM_ASCEND_CPU_GATHER_THREADS", "4"))),
+    # Floor for the pinned packed host buffer size in bytes. The actual buffer
+    # is max(this, max_num_topk_rows * topk * (token_k + token_v) bytes).
+    # Valid range: >= 4096. Default: 8 MiB.
+    "VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES": lambda: max(
+        4096, int(os.getenv("VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES", str(8 * 1024 * 1024)))
+    ),
 }
 
 # end-env-vars-definition

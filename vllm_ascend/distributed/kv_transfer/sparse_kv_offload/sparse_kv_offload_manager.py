@@ -370,6 +370,21 @@ class SparseKVOffloadManager:
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
 
+        # Packed onload state. The real init happens in register_kv_caches via
+        # _init_cpu_gather_h2d(), once token sizes and topk buffers are known.
+        self._enable_cpu_gather_h2d = False
+        self._cpu_gather_threads = 1
+        self._cpu_gather_buffer_bytes = 0
+        self._packed_host_buf: torch.Tensor | None = None
+        self._packed_staging_npu: torch.Tensor | None = None
+        self._scatter_slots_k_cpu: torch.Tensor | None = None
+        self._scatter_slots_v_cpu: torch.Tensor | None = None
+        self._scatter_slots_k_npu: torch.Tensor | None = None
+        self._scatter_slots_v_npu: torch.Tensor | None = None
+        self._packed_nbytes = 0
+        self._packed_n_k = 0
+        self._packed_n_v = 0
+
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
         ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
@@ -761,6 +776,152 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+        self._init_cpu_gather_h2d()
+
+    def _init_cpu_gather_h2d(self) -> None:
+        """Packed onload: CPU gather + one contiguous H2D + D2D index_copy_.
+
+        With VLLM_ASCEND_ENABLE_CPU_GATHER_H2D=1 the eager onload hot path no
+        longer calls memfabric sparse_copy:
+          1. TP0 OpenMP-packs discrete host blocks into one pinned buffer;
+          2. a single contiguous H2D copies it into an NPU staging buffer;
+          3. index_copy_ scatters the packed rows into topk slots (D2D).
+        For TP > 1, TP0 broadcasts the staging buffer over HCCL before each
+        rank scatters locally. ACL graph capture/replay keeps the discrete
+        memfabric path because the packed H2D length is dynamic per step.
+        """
+        from vllm_ascend import envs
+
+        self._enable_cpu_gather_h2d = bool(envs.VLLM_ASCEND_ENABLE_CPU_GATHER_H2D)
+        if not self._enable_cpu_gather_h2d:
+            return
+
+        self._cpu_gather_threads = max(1, int(envs.VLLM_ASCEND_CPU_GATHER_THREADS))
+        max_slots_per_kv = self.max_num_topk_rows * self.topk
+        max_packed_bytes = max_slots_per_kv * (self.token_size_bytes_k + self.token_size_bytes_v)
+        self._cpu_gather_buffer_bytes = max(int(envs.VLLM_ASCEND_CPU_GATHER_BUFFER_BYTES), int(max_packed_bytes))
+        device = self.topk_buffers_k[0].device
+
+        # Only TP0 packs into the pinned host staging; other ranks never touch
+        # host data and receive the packed bytes through the staging broadcast.
+        if self.tp_rank == 0:
+            self._packed_host_buf = torch.empty(
+                [self._cpu_gather_buffer_bytes], dtype=torch.int8, device="cpu", pin_memory=True
+            )
+        # Every rank owns an NPU staging buffer: it is the H2D destination and
+        # broadcast source on TP0, and the broadcast destination elsewhere.
+        # One manager-level buffer is enough because layers onload serially.
+        self._packed_staging_npu = torch.empty([self._cpu_gather_buffer_bytes], dtype=torch.int8, device=device)
+        # Scatter slot metadata in compact pack order; shared validity rule
+        # with the pack keeps staging rows and slot indices aligned.
+        self._scatter_slots_k_cpu = torch.empty([max_slots_per_kv], dtype=torch.int64, device="cpu", pin_memory=True)
+        self._scatter_slots_v_cpu = torch.empty([max_slots_per_kv], dtype=torch.int64, device="cpu", pin_memory=True)
+        self._scatter_slots_k_npu = torch.empty([max_slots_per_kv], dtype=torch.int64, device=device)
+        self._scatter_slots_v_npu = torch.empty([max_slots_per_kv], dtype=torch.int64, device=device)
+        logger.info(
+            "Sparse KV offload CPU gather H2D enabled (pack + one contiguous H2D + index_copy_ scatter): "
+            "threads=%d, buffer_bytes=%d, tp_size=%d",
+            self._cpu_gather_threads,
+            self._cpu_gather_buffer_bytes,
+            self.tp_size,
+        )
+
+    def _should_use_cpu_gather(self, capturing: bool = False) -> bool:
+        """Packed onload is eager-only; graph capture keeps the discrete path."""
+        return bool(self._enable_cpu_gather_h2d) and not capturing
+
+    def _prepare_packed_onload_cpu(
+        self,
+        gvas_buffer: torch.Tensor,
+        addr_buffer: torch.Tensor,
+        size_buffer: torch.Tensor,
+        num_tokens_buffer: torch.Tensor,
+        addr_k_base: int,
+        addr_v_base: int,
+        token_size_bytes_k: int,
+        token_size_bytes_v: int,
+    ) -> None:
+        """Host callback: build scatter slots (all ranks), then TP0 packs.
+
+        On success sets _packed_nbytes/_packed_n_k/_packed_n_v; on any failure
+        leaves _packed_nbytes == 0 so the caller falls back to the discrete
+        memfabric sparse_copy path with the untouched descriptors.
+        """
+        self._packed_nbytes = 0
+        self._packed_n_k = 0
+        self._packed_n_v = 0
+        num_entries = int(num_tokens_buffer.view(-1)[0].item())
+        if num_entries <= 0 or num_entries > int(gvas_buffer.numel()):
+            return
+
+        n_k, n_v, nbytes = self.sparse_kv_offload_cpp.packed_fill_scatter_slots(
+            gvas_buffer,
+            addr_buffer,
+            size_buffer,
+            num_entries,
+            addr_k_base,
+            addr_v_base,
+            token_size_bytes_k,
+            token_size_bytes_v,
+            self._cpu_gather_buffer_bytes,
+            self._scatter_slots_k_cpu,
+            self._scatter_slots_v_cpu,
+        )
+        if nbytes <= 0:
+            if nbytes < 0:
+                logger.warning_once(
+                    "CPU gather packed onload skipped this step: slot/overflow check failed; "
+                    "falling back to discrete sparse_copy."
+                )
+            return
+        self._packed_n_k = n_k
+        self._packed_n_v = n_v
+        self._packed_nbytes = nbytes
+        if self.tp_rank != 0:
+            return
+
+        packed = int(
+            self.sparse_kv_offload_cpp.packed_host_gather(
+                gvas_buffer,
+                addr_buffer,
+                size_buffer,
+                num_entries,
+                self._packed_host_buf.data_ptr(),
+                self._cpu_gather_buffer_bytes,
+                self._cpu_gather_threads,
+            )
+        )
+        if packed != nbytes:
+            logger.warning_once(
+                "CPU gather packed onload pack mismatch: packed=%s expect=%s; falling back to discrete sparse_copy.",
+                packed,
+                nbytes,
+            )
+            self._packed_nbytes = 0
+
+    def _scatter_packed_onload(self, layer_id: int) -> None:
+        """D2D scatter of the packed staging rows into this layer's topk slots."""
+        n_k = self._packed_n_k
+        n_v = self._packed_n_v
+        itemsize = torch.bfloat16.itemsize
+        if n_k > 0:
+            k_dim = self.token_size_bytes_k // itemsize
+            staging_k = self._packed_staging_npu[: n_k * self.token_size_bytes_k].view(torch.bfloat16).view(n_k, k_dim)
+            self.topk_buffers_k[layer_id].view(-1, k_dim).index_copy_(
+                0, self._scatter_slots_k_npu[:n_k], staging_k
+            )
+        if n_v > 0:
+            v_dim = self.token_size_bytes_v // itemsize
+            v_start = n_k * self.token_size_bytes_k
+            staging_v = (
+                self._packed_staging_npu[v_start : v_start + n_v * self.token_size_bytes_v]
+                .view(torch.bfloat16)
+                .view(n_v, v_dim)
+            )
+            self.topk_buffers_v[layer_id].view(-1, v_dim).index_copy_(
+                0, self._scatter_slots_v_npu[:n_v], staging_v
+            )
+
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
@@ -892,7 +1053,12 @@ class SparseKVOffloadManager:
                 non_blocking=capturing,
             )
 
-        if skip_topk:
+        use_cpu_gather = self._should_use_cpu_gather(capturing)
+        packed_ready = False
+        # Packed srcs/slots are rebuilt per layer from this layer's own
+        # descriptors, so skip_topk cannot pointer-add the previous layer's
+        # descriptors; run the full path instead.
+        if skip_topk and not use_cpu_gather:
             assert layer_id > 0, "No previous layer to reuse."
             gvas_offset = self.gvas_k_bases[layer_id] - self.gvas_k_bases[layer_id - 1]
             addr_offset = self.addr_k_bases[layer_id] - self.addr_k_bases[layer_id - 1]
@@ -945,6 +1111,7 @@ class SparseKVOffloadManager:
                 self.size_buffer_cpu,
                 self.num_tokens_buffer_cpu,
                 layer_id,
+                use_cpu_gather,
             )
 
             if capturing:
@@ -961,19 +1128,45 @@ class SparseKVOffloadManager:
             else:
                 self._onload_topk_kv_cpu(args)
 
-            self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+            packed_ready = use_cpu_gather and self._packed_nbytes > 0
+            if packed_ready:
+                # Only the scatter slot metadata goes H2D; the discrete
+                # descriptors stay on host because the packed path never
+                # calls memfabric sparse_copy.
+                if self._packed_n_k > 0:
+                    self._scatter_slots_k_npu[: self._packed_n_k].copy_(
+                        self._scatter_slots_k_cpu[: self._packed_n_k], non_blocking=True
+                    )
+                if self._packed_n_v > 0:
+                    self._scatter_slots_v_npu[: self._packed_n_v].copy_(
+                        self._scatter_slots_v_cpu[: self._packed_n_v], non_blocking=True
+                    )
+                if self.tp_rank == 0:
+                    nbytes = self._packed_nbytes
+                    self._packed_staging_npu[:nbytes].copy_(self._packed_host_buf[:nbytes], non_blocking=True)
+            else:
+                self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
 
         if self.tp_size > 1:
-            # Make sure that tp0 d2h is finished before other tp's h2d.
-            # NOTE we can't use barrier since it can't be captured in graph.
-            self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
-        offload.sparse_copy(
-            self.gvas_buffer_npu,
-            self.addr_buffer_npu,
-            self.size_buffer_npu,
-            self.num_tokens_buffer_npu,
-            self.topk_buffers_k[0].device,
-        )
+            if packed_ready:
+                # The staging broadcast doubles as the cross-rank sync: TP0's
+                # pack and H2D are stream-ordered before it, so other ranks
+                # scatter only after the packed bytes have landed.
+                self.tp_group.broadcast(self._packed_staging_npu[: self._packed_nbytes], src=0)
+            else:
+                # Make sure that tp0 d2h is finished before other tp's h2d.
+                # NOTE we can't use barrier since it can't be captured in graph.
+                self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
+        if packed_ready:
+            self._scatter_packed_onload(layer_id)
+        else:
+            offload.sparse_copy(
+                self.gvas_buffer_npu,
+                self.addr_buffer_npu,
+                self.size_buffer_npu,
+                self.num_tokens_buffer_npu,
+                self.topk_buffers_k[0].device,
+            )
 
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
@@ -1013,6 +1206,7 @@ class SparseKVOffloadManager:
             size_buffer,
             num_tokens_buffer,
             layer_id,
+            use_cpu_gather,
         ) = args
         self.sparse_kv_offload_cpp.lru_resident_compact(
             lru_req_ids_ptr,
@@ -1056,6 +1250,19 @@ class SparseKVOffloadManager:
             size_buffer,
             num_tokens_buffer,
         )
+        if use_cpu_gather:
+            # The flag is bound into the captured host-func args, so graph
+            # replay always takes the discrete path recorded at capture time.
+            self._prepare_packed_onload_cpu(
+                gvas_buffer,
+                addr_buffer,
+                size_buffer,
+                num_tokens_buffer,
+                addr_k_bases,
+                addr_v_bases,
+                token_size_bytes_k,
+                token_size_bytes_v,
+            )
 
 
 _SPARSE_KV_OFFLOAD_MANAGER: SparseKVOffloadManager | None = None

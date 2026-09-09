@@ -4,10 +4,13 @@
 #include <iostream>
 #include <chrono>
 #include <string>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
+#include <cstddef>
 #include <numeric>
+#include <tuple>
 #include <ATen/Parallel.h>
 #include <torch/script.h>
 
@@ -327,10 +330,159 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
   return num_tokens_to_load_sum;
 }
 
+// ---- Packed onload: CPU gather + one contiguous H2D + D2D index_copy_ ----
+// These helpers power VLLM_ASCEND_ENABLE_CPU_GATHER_H2D. The onload hot path
+// packs discrete host blocks into one pinned buffer (TP0 only), issues a
+// single contiguous H2D, then scatters with index_copy_; memfabric
+// sparse_copy is not used on this path.
+
+// Shared validity rule for packed onload entries. packed_host_gather and
+// packed_fill_scatter_slots MUST use the same rule so that the compact
+// packing order matches the scatter slot order.
+FORCE_INLINE bool is_valid_pack_entry(const int64_t src, const int64_t dst, const int32_t size) {
+  return size > 0 && src != 0 && dst != 0;
+}
+
+// OpenMP-gather discrete host blocks into one contiguous pinned buffer.
+// Runs on TP0 only. Returns packed nbytes, 0 when nothing valid to pack,
+// or -1 when a single item / the total exceeds buffer_bytes.
+int64_t packed_host_gather(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs, const at::Tensor& sizes,
+                           int64_t num_entries, int64_t host_base, int64_t buffer_bytes, int32_t num_threads) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_host_gather pointer/size tensors must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_host_gather src/dst must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_host_gather sizes must be int32");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_host_gather num_entries exceeds tensor length");
+  TORCH_CHECK(buffer_bytes > 0, "packed_host_gather buffer_bytes must be > 0");
+  TORCH_CHECK(host_base != 0, "packed_host_gather null staging ptr");
+
+  if (num_entries <= 0) {
+    return 0;
+  }
+
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+
+  int32_t max_item = 0;
+  int64_t used = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    max_item = std::max(max_item, sz[i]);
+    if (is_valid_pack_entry(src[i], dst[i], sz[i])) {
+      used += sz[i];
+    }
+  }
+  if (max_item > buffer_bytes || used > buffer_bytes) {
+    return -1;
+  }
+  if (used == 0) {
+    return used;
+  }
+
+  char* host = reinterpret_cast<char*>(host_base);
+  const int omp_threads = std::max(num_threads, 1);
+  std::vector<int64_t> pack_src;
+  std::vector<int64_t> pack_off;
+  std::vector<int32_t> pack_sz;
+  pack_src.reserve(static_cast<size_t>(num_entries));
+  pack_off.reserve(static_cast<size_t>(num_entries));
+  pack_sz.reserve(static_cast<size_t>(num_entries));
+  int64_t offset = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (!is_valid_pack_entry(src[i], dst[i], sz[i])) {
+      continue;
+    }
+    pack_src.push_back(src[i]);
+    pack_off.push_back(offset);
+    pack_sz.push_back(sz[i]);
+    offset += sz[i];
+  }
+
+  const int64_t n_pack = static_cast<int64_t>(pack_src.size());
+  const int n_threads = std::max(1, static_cast<int>(std::min(static_cast<int64_t>(omp_threads), n_pack)));
+#pragma omp parallel for num_threads(n_threads) schedule(static)
+  for (int64_t i = 0; i < n_pack; ++i) {
+    std::memcpy(host + pack_off[i], reinterpret_cast<const void*>(pack_src[i]), static_cast<size_t>(pack_sz[i]));
+  }
+  return used;
+}
+
+// Build dst slot indices for the D2D index_copy_ scatter, using the same
+// compact ordering as packed_host_gather. Runs on every rank (metadata only,
+// no data touch). Descriptor layout contract with compute_lru_resident_addrs:
+// entries [0, num_entries/2) are K, [num_entries/2, num_entries) are V.
+// slot = (dst_addr - addr_base) / token_bytes.
+// Returns (num_valid_k, num_valid_v, packed_nbytes); packed_nbytes is -1 on
+// overflow of buffer_bytes or on a negative/unaligned slot.
+std::tuple<int64_t, int64_t, int64_t> packed_fill_scatter_slots(const at::Tensor& src_ptrs, const at::Tensor& dst_ptrs,
+                                                                const at::Tensor& sizes, int64_t num_entries,
+                                                                int64_t addr_k_base, int64_t addr_v_base,
+                                                                int64_t token_bytes_k, int64_t token_bytes_v,
+                                                                int64_t buffer_bytes, at::Tensor& scatter_slots_k,
+                                                                at::Tensor& scatter_slots_v) {
+  TORCH_CHECK(src_ptrs.device().is_cpu() && dst_ptrs.device().is_cpu() && sizes.device().is_cpu(),
+              "packed_fill_scatter_slots pointer/size tensors must be CPU");
+  TORCH_CHECK(scatter_slots_k.device().is_cpu() && scatter_slots_v.device().is_cpu(),
+              "packed_fill_scatter_slots slot outputs must be CPU");
+  TORCH_CHECK(src_ptrs.scalar_type() == at::kLong && dst_ptrs.scalar_type() == at::kLong,
+              "packed_fill_scatter_slots src/dst must be int64");
+  TORCH_CHECK(sizes.scalar_type() == at::kInt, "packed_fill_scatter_slots sizes must be int32");
+  TORCH_CHECK(scatter_slots_k.scalar_type() == at::kLong && scatter_slots_v.scalar_type() == at::kLong,
+              "packed_fill_scatter_slots slot outputs must be int64");
+  TORCH_CHECK(src_ptrs.size(0) >= num_entries && dst_ptrs.size(0) >= num_entries && sizes.size(0) >= num_entries,
+              "packed_fill_scatter_slots num_entries exceeds tensor length");
+  TORCH_CHECK(token_bytes_k > 0 && token_bytes_v > 0, "packed_fill_scatter_slots token bytes must be > 0");
+  TORCH_CHECK(buffer_bytes > 0, "packed_fill_scatter_slots buffer_bytes must be > 0");
+
+  const int64_t* src = src_ptrs.data_ptr<int64_t>();
+  const int64_t* dst = dst_ptrs.data_ptr<int64_t>();
+  const int32_t* sz = sizes.data_ptr<int32_t>();
+  int64_t* slots_k = scatter_slots_k.data_ptr<int64_t>();
+  int64_t* slots_v = scatter_slots_v.data_ptr<int64_t>();
+
+  const int64_t kv_split = num_entries / 2;
+  int64_t n_k = 0;
+  int64_t n_v = 0;
+  int64_t nbytes = 0;
+  for (int64_t i = 0; i < num_entries; ++i) {
+    if (!is_valid_pack_entry(src[i], dst[i], sz[i])) {
+      continue;
+    }
+    nbytes += sz[i];
+    if (nbytes > buffer_bytes) {
+      return std::make_tuple(n_k, n_v, static_cast<int64_t>(-1));
+    }
+    const bool is_k = i < kv_split;
+    const int64_t base = is_k ? addr_k_base : addr_v_base;
+    const int64_t token_bytes = is_k ? token_bytes_k : token_bytes_v;
+    const int64_t delta = dst[i] - base;
+    if (delta < 0 || delta % token_bytes != 0) {
+      return std::make_tuple(n_k, n_v, static_cast<int64_t>(-1));
+    }
+    const int64_t slot = delta / token_bytes;
+    if (is_k) {
+      TORCH_CHECK(n_k < scatter_slots_k.size(0), "packed_fill_scatter_slots slots_k too short");
+      slots_k[n_k] = slot;
+      ++n_k;
+    } else {
+      TORCH_CHECK(n_v < scatter_slots_v.size(0), "packed_fill_scatter_slots slots_v too short");
+      slots_v[n_v] = slot;
+      ++n_v;
+    }
+  }
+  return std::make_tuple(n_k, n_v, nbytes);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   m.def("lru_resident_compact", &lru_resident_compact,
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
+  m.def("packed_host_gather", &packed_host_gather,
+        "OpenMP gather of discrete host blocks into one contiguous pinned buffer (TP0 only)");
+  m.def("packed_fill_scatter_slots", &packed_fill_scatter_slots,
+        "Build compact dst slot indices for the packed D2D index_copy_ scatter (all ranks)");
 }
